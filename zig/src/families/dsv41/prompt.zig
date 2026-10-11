@@ -125,6 +125,11 @@ pub const Engine = struct {
     round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
+    // adaptive top-k in decode windows (TF_DS_TOPK_TAU > 0: routed slots under tau x the row's top weight dropped, at
+    // least TF_DS_TOPK_MIN kept; TF_DS_TOPK_RENORM=0 leaves the kept weights as they were). Off by default.
+    topk_tau: f32 = 0,
+    topk_min: u32 = 4,
+    topk_renorm: bool = true,
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.

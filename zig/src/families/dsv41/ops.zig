@@ -37,6 +37,7 @@ pub const Ops = struct {
     copy16: cuda.Function,
     argmax_rows: cuda.Function,
     gpu_clock: cuda.Function,
+    route_trim: cuda.Function,
 
     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
@@ -68,6 +69,7 @@ pub const Ops = struct {
             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
+            .route_trim = try fm.function("tf_ds_route_trim_kernel"),
         };
     }
 
@@ -300,6 +302,20 @@ pub const Ops = struct {
         a.add(@as(u32, @intFromBool(reset)));
         a.add(cap);
         try go(o.gpu_clock, s, 1, 32, &a);
+    }
+
+    /// Adaptive top-k (tf_ds_route_trim_kernel): routed slots under tau x the row's top weight unrouted.
+    pub fn routeTrim(o: *const Ops, s: cuda.Stream, pick: u64, wts: u64, rows: usize, slots: usize, k: usize, tau: f32, kmin: u32, renorm: bool) !void {
+        var a: cuda.Args = .{};
+        a.add(pick);
+        a.add(wts);
+        a.add(@as(c_int, @intCast(rows)));
+        a.add(@as(c_int, @intCast(slots)));
+        a.add(@as(c_int, @intCast(k)));
+        a.add(tau);
+        a.add(@as(c_int, @intCast(kmin)));
+        a.add(@as(c_int, @intFromBool(renorm)));
+        try go(o.route_trim, s, (rows + 63) / 64, 64, &a);
     }
 
     /// dst row i = src row idx[i] (int64 indices, rows of `bytes` bytes); an index outside [0, src_rows) sets the

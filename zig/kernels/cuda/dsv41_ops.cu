@@ -511,3 +511,43 @@ extern "C" __global__ void tf_ds_vspan_kernel(const unsigned char* types, const 
         out[i] = ty == 1 ? rows[(long long)row_of[t] * dim + c] : ty == 0 ? start[c] : ty == 2 ? newline[c] : end[c];
     }
 }
+
+// Adaptive top-k for the routed experts of a decode window (TF_DS_TOPK_TAU). Each row's routed slots (0 .. k-1; the
+// shared expert sits in slot `slots - 1`) whose weight is below tau x the row's largest routed weight are not routed
+// (pick -1: the EXL3 decode path reads no weights for them), keeping at least kmin slots (the heaviest). With renorm
+// the kept routed weights are scaled so their sum is the row's routed sum before. One thread a row: a row's result
+// depends on its own weights alone, so drafted == serial still holds.
+extern "C" __global__ void tf_ds_route_trim_kernel(int* pick, float* wts, int rows, int slots, int k, float tau, int kmin,
+                                                   int renorm) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    int* p = pick + (size_t)r * slots;
+    float* w = wts + (size_t)r * slots;
+    float mx = 0.f, sum = 0.f;
+    for (int q = 0; q < k; ++q) {
+        if (p[q] < 0) continue;
+        mx = fmaxf(mx, w[q]);
+        sum += w[q];
+    }
+    if (mx <= 0.f) return;
+    int kept = 0;
+    for (int q = 0; q < k; ++q) kept += p[q] >= 0;
+    while (kept > kmin) {
+        int lo = -1;
+        for (int q = 0; q < k; ++q)
+            if (p[q] >= 0 && (lo < 0 || w[q] < w[lo])) lo = q;
+        if (lo < 0 || w[lo] >= tau * mx) break;
+        p[lo] = -1;
+        --kept;
+    }
+    if (renorm) {
+        float left = 0.f;
+        for (int q = 0; q < k; ++q)
+            if (p[q] >= 0) left += w[q];
+        const float s = left > 0.f ? sum / left : 1.f;
+        for (int q = 0; q < k; ++q) w[q] = p[q] >= 0 ? w[q] * s : 0.f;
+    } else {
+        for (int q = 0; q < k; ++q)
+            if (p[q] < 0) w[q] = 0.f;
+    }
+}

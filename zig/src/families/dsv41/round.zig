@@ -737,6 +737,7 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const sl = e.slots();
     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
+    if (e.topk_tau > 0) try e.ops.routeTrim(e.s, rd.pick, rd.mw, R, sl, c.top_k, e.topk_tau, e.topk_min, e.topk_renorm);
     try rd.mark(e, .m_rt);
     if (e.two) |tw| {
         // 2D (round2d.experts, the profile's marks between): gate / up, the intermediate's exchange, down

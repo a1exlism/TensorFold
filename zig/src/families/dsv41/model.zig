@@ -274,6 +274,10 @@ pub const Model = struct {
             }
         }
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+        if (std.c.getenv("TF_DS_TOPK_TAU")) |v| m.eng.topk_tau = std.fmt.parseFloat(f32, std.mem.span(v)) catch 0;
+        if (std.c.getenv("TF_DS_TOPK_MIN")) |v| m.eng.topk_min = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4;
+        if (std.c.getenv("TF_DS_TOPK_RENORM")) |v| m.eng.topk_renorm = !std.mem.eql(u8, std.mem.span(v), "0");
+        if (m.eng.topk_tau > 0) std.log.info("adaptive top-k in decode: tau {d}, at least {d} experts, renorm {}", .{ m.eng.topk_tau, m.eng.topk_min, m.eng.topk_renorm });
         m.eng.round_rows = o.round_rows;
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
