@@ -18,6 +18,7 @@ const lanes = @import("lanes");
 const model = @import("model.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
+const spill_mod = @import("spill.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
 const cuda = @import("cuda");
@@ -37,7 +38,7 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, snap_spill = 10, snap_fill = 11 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -218,7 +219,7 @@ extern "c" fn exp(x: f64) f64;
 /// replay): the slot's own part on the device (Model.snapCopy), and the extent its compressed rows stay in,
 /// [base, base + at), held back from placement while it lives. Stale: a placement needed that room (its restore fails
 /// and the prompt runs from 0).
-pub const Snap = struct { id: u64, at: usize, base: usize, buf: cuda.DeviceBuffer, stale: bool = false };
+pub const Snap = struct { id: u64, at: usize, base: usize, buf: cuda.DeviceBuffer, stale: bool = false, spilled: bool = false }; // spilled: stale in the pool, its rows on disk
 
 /// First tokens a handle names (each prompt's draw, read back right after its prefill).
 const ring = 1024;
@@ -242,9 +243,11 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
+    spill: spill_mod.Spill = .{}, // kept states' rows on disk when the pool needs their room (TF_DS_SPILL_DIR)
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+        ln.spill = spill_mod.Spill.fromEnv(gpa, 0);
         // the round costs by rows: ROUND_MS[min(rows, len) - 1] (the served table, or TF_DS_ROUND_MS)
         const t = m.round_ms;
         for (&ln.wc, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t[@min(i, t.len - 1)] };
@@ -259,6 +262,7 @@ pub const Lanes = struct {
             self.gpa.destroy(sn);
         }
         self.snaps.deinit(self.gpa);
+        self.spill.deinit(self.gpa);
         if (self.peer != null) self.send(.done) catch {};
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
@@ -374,11 +378,11 @@ pub const Lanes = struct {
             // a kept state of a prompt with images is keyed by the images' bytes too (lane_host imageKey)
             if (self.usable(sn, len)) {
                 kept = sn;
-                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size);
+                moved = sn.spilled or sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size);
             } else s.reuse_failed = true;
         }
         const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size);
-        if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
+        if (kept) |sn| if (moved and sn.stale and !sn.spilled) { // the placement needed the kept rows' room: the prompt runs from 0
             kept = null;
             s.reuse_failed = true;
         };
@@ -454,6 +458,20 @@ pub const Lanes = struct {
         const replay = len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
+            if (sn.spilled) { // its rows back from disk into this extent, on both ranks, then restored in place
+                if (try self.begin(.snap_fill)) {
+                    try self.wire.int(gpa, u64, sn.id);
+                    try self.wire.int(gpa, u64, base);
+                    try self.wire.int(gpa, u64, sn.at);
+                    try self.flush();
+                }
+                const t_fill = m.now();
+                try self.spill.read(m, sn.id, base, sn.at);
+                std.log.info("spill: {d} tokens of a kept prompt read back in {d:.1} ms", .{ sn.at, @as(f64, @floatFromInt(m.now() - t_fill)) / 1e6 });
+                sn.base = base;
+                sn.spilled = false;
+                sn.stale = false;
+            }
             if (try self.begin(.snap_restore)) {
                 try self.wire.int(gpa, u64, sn.id);
                 try self.wire.int(gpa, u32, @intCast(slot));
@@ -674,7 +692,7 @@ pub const Lanes = struct {
     /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
     fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
-        return !sn.stale and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
+        return (!sn.stale or sn.spilled) and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
     }
 
     /// The first extent that fits around the live streams and the kept states; the oldest kept states go stale
@@ -691,15 +709,42 @@ pub const Lanes = struct {
             const oldest = for (self.snaps.items) |sn| {
                 if (!sn.stale) break sn;
             } else return error.ContextFull;
-            oldest.stale = true;
+            self.evict(oldest);
         }
     }
 
     /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
     fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) void {
-        for (self.snaps.items) |sn| if (sn != except and sn.base < hi and lo < sn.base + sn.at) {
-            sn.stale = true;
+        for (self.snaps.items) |sn| if (sn != except and !sn.stale and sn.base < hi and lo < sn.base + sn.at) {
+            self.evict(sn);
         };
+    }
+
+    /// A kept state whose rows a stream is about to write over: spilled to disk on both ranks (TF_DS_SPILL_DIR set,
+    /// room under its cap), else stale as before (its prompt then runs from 0).
+    fn evict(self: *Lanes, sn: *Snap) void {
+        sn.stale = true;
+        if (!self.spill.on()) return;
+        const m = self.m;
+        const t0 = m.now();
+        if (!self.spill.has(sn.id)) {
+            self.spill.write(self.gpa, m, sn.id, sn.base, sn.at) catch |err| {
+                std.log.warn("spill: kept prompt of {d} tokens not spilled ({s}): it goes stale", .{ sn.at, @errorName(err) });
+                return;
+            };
+            if (self.begin(.snap_spill) catch false) {
+                self.wire.int(self.gpa, u64, sn.id) catch {};
+                self.wire.int(self.gpa, u64, sn.base) catch {};
+                self.wire.int(self.gpa, u64, sn.at) catch {};
+                self.flush() catch |err| {
+                    std.log.err("spill: rank 1 did not hear a spill: {s}", .{@errorName(err)});
+                    self.spill.forget(sn.id);
+                    return;
+                };
+            }
+            std.log.info("spill: kept prompt of {d} tokens written in {d:.1} ms ({d} MiB on disk)", .{ sn.at, @as(f64, @floatFromInt(m.now() - t0)) / 1e6, self.spill.used >> 20 });
+        }
+        sn.spilled = true;
     }
 
     /// The prompt cache's Snapshots functions (native.zig hands them to the CUDA host).
@@ -738,6 +783,7 @@ pub const Lanes = struct {
         const sn: *Snap = @ptrCast(@alignCast(saved));
         const i = std.mem.indexOfScalar(*Snap, self.snaps.items, sn) orelse return;
         _ = self.snaps.orderedRemove(i);
+        self.spill.forget(sn.id);
         if (self.begin(.snap_drop) catch false) {
             self.wire.int(self.gpa, u64, sn.id) catch {};
             self.flush() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
@@ -786,6 +832,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     var img_rows: std.ArrayList(u8) = .empty; // a prompt's image rows as their pieces come
     defer img_rows.deinit(gpa);
     var kept: std.AutoHashMapUnmanaged(u64, cuda.DeviceBuffer) = .empty; // rank 0's kept states, this rank's part
+    var spill = spill_mod.Spill.fromEnv(gpa, m.rank); // this rank's spilled kept rows
+    defer spill.deinit(gpa);
     defer {
         var ki = kept.valueIterator();
         while (ki.next()) |b| b.free();
@@ -805,12 +853,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             7 => .snap_drop,
             8 => .fill_images,
             9 => .done,
+            10 => .snap_spill,
+            11 => .snap_fill,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
-        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images) {
+        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images and kind != .snap_spill and kind != .snap_fill) {
             m.joinAhead();
             m.fill_seq = &.{};
         }
@@ -910,8 +960,21 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (from != to) m.copyExtent(from, to, at) catch |err| refused(err);
                 m.snapCopy(s, b.ptr, false) catch |err| refused(err);
             },
+            .snap_spill => { // this rank's rows of a kept state to disk (rank 0 wrote its own)
+                const id = try r.int(u64);
+                const base: usize = @intCast(try r.int(u64));
+                const at: usize = @intCast(try r.int(u64));
+                spill.write(gpa, m, id, base, at) catch |err| refused(err);
+            },
+            .snap_fill => { // this rank's rows of a spilled kept state back into the extent at `to`
+                const id = try r.int(u64);
+                const to: usize = @intCast(try r.int(u64));
+                const at: usize = @intCast(try r.int(u64));
+                spill.read(m, id, to, at) catch |err| refused(err);
+            },
             .snap_drop => {
                 const id = try r.int(u64);
+                spill.forget(id);
                 if (kept.fetchRemove(id)) |kv| {
                     var b = kv.value;
                     b.free();

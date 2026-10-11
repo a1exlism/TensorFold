@@ -486,6 +486,60 @@ pub const Model = struct {
         }
     }
 
+    /// The bytes of an extent's compressed rows for positions [0, at): every kv-source layer's codes and scales and its
+    /// index keys, as copyExtent moves them.
+    pub fn extentBytes(m: *const Model, at: usize) usize {
+        const c = m.eng.c;
+        var n: usize = 0;
+        for (m.eng.w.layers) |lay| {
+            if (lay.comp_wkv == null) continue;
+            const rows = at / @as(usize, lay.ratio);
+            n += rows * (c.head_dim / 2 + c.head_dim / 16);
+            if (lay.idx_wk != null) n += rows * (c.index_head_dim / 2 + c.index_head_dim / 32);
+        }
+        return n;
+    }
+
+    /// The extent at `base`'s compressed rows [0, at) streamed through `bounce` (4 KiB-aligned) into file `fd` (save)
+    /// or back from it, in copyExtent's order, each piece at a 4 KiB-aligned file offset (O_DIRECT); every copy
+    /// synchronized before its piece is reused. Returns the file's bytes.
+    pub fn diskExtent(m: *Model, base: usize, at: usize, fd: std.c.fd_t, bounce: []align(4096) u8, save: bool) !u64 {
+        const c = m.eng.c;
+        const cs = &m.caches;
+        const d = m.ctx.d;
+        var foff: u64 = 0;
+        for (m.eng.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const r: usize = lay.ratio;
+            if (base % r != 0 or at % r != 0) return error.BadView;
+            const n = at / r;
+            const planes = [4]u64{ cs.comp_codes[i], cs.comp_scales[i], cs.idx_codes[i], cs.idx_scales[i] };
+            const widths = [4]usize{ c.head_dim / 2, c.head_dim / 16, c.index_head_dim / 2, c.index_head_dim / 32 };
+            for (planes, widths, 0..) |plane, row, k| {
+                if (k >= 2 and lay.idx_wk == null) continue;
+                const bytes = n * row;
+                const dev: u64 = plane + @as(u64, base / r) * row;
+                var done: usize = 0;
+                while (done < bytes) {
+                    const piece = @min(bounce.len, bytes - done);
+                    const padded = std.mem.alignForward(usize, piece, 4096);
+                    if (save) {
+                        try d.check(d.api.cuMemcpyDtoHAsync_v2(@ptrCast(bounce.ptr), dev + done, piece, m.stream.handle), "cuMemcpyDtoHAsync");
+                        try m.stream.synchronize();
+                        try pwriteAll(fd, bounce[0..padded], foff);
+                    } else {
+                        try preadAll(fd, bounce[0..padded], foff);
+                        try d.check(d.api.cuMemcpyHtoDAsync_v2(dev + done, @ptrCast(bounce.ptr), piece, m.stream.handle), "cuMemcpyHtoDAsync");
+                        try m.stream.synchronize();
+                    }
+                    foff += padded;
+                    done += piece;
+                }
+            }
+        }
+        return foff;
+    }
+
     fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
         const d = m.ctx.d;
         try d.check(d.api.cuMemcpyDtoDAsync_v2(plane + to * row, plane + from * row, n * row, m.stream.handle), "cuMemcpyDtoDAsync");
@@ -767,3 +821,31 @@ pub const Model = struct {
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
     }
 };
+
+/// Every byte of `buf` written at `off` (EINTR retried).
+fn pwriteAll(fd: std.c.fd_t, buf: []const u8, off: u64) !void {
+    var done: usize = 0;
+    while (done < buf.len) {
+        const n = std.c.pwrite(fd, buf.ptr + done, buf.len - done, @intCast(off + done));
+        if (n < 0) {
+            if (std.c.errno(n) == .INTR) continue;
+            return error.SpillWrite;
+        }
+        if (n == 0) return error.SpillWrite;
+        done += @intCast(n);
+    }
+}
+
+/// `buf` filled from `off` (EINTR retried; a short file is an error).
+fn preadAll(fd: std.c.fd_t, buf: []u8, off: u64) !void {
+    var done: usize = 0;
+    while (done < buf.len) {
+        const n = std.c.pread(fd, buf.ptr + done, buf.len - done, @intCast(off + done));
+        if (n < 0) {
+            if (std.c.errno(n) == .INTR) continue;
+            return error.SpillRead;
+        }
+        if (n == 0) return error.SpillShort;
+        done += @intCast(n);
+    }
+}
