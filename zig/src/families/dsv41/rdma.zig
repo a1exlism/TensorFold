@@ -280,7 +280,8 @@ pub const Ring = struct {
             peer.* = .{ .qpn = ri.qpn, .psn = ri.psn, .rkey = ri.rkey, .gid = ri.gid, .recv = ri.recv };
             for (r.nics[0..r.nd], 0..) |n, d| {
                 const qp = n.qps[p].?;
-                var a: vabi.QpAttr = .{ .qp_state = vabi.qps_rtr, .path_mtu = mtu_4096, .dest_qp_num = ri.qpn[d], .rq_psn = ri.psn[d], .max_dest_rd_atomic = 1, .min_rnr_timer = 12 };
+                const port_mtu: c_int = if (r.v.port(@ptrCast(n.ctx), 1)) |pa| pa.active_mtu else |_| mtu_4096;
+                var a: vabi.QpAttr = .{ .qp_state = vabi.qps_rtr, .path_mtu = @min(mtu_4096, port_mtu), .dest_qp_num = ri.qpn[d], .rq_psn = ri.psn[d], .max_dest_rd_atomic = 1, .min_rnr_timer = 12 };
                 a.ah_attr = .{ .grh = .{ .dgid = .{ .raw = ri.gid[d] }, .sgid_index = r.s.gid_index, .hop_limit = 64 }, .is_global = 1, .port_num = 1 };
                 if (api.ibv_modify_qp(qp, &a, m.state | m.av | m.path_mtu | m.dest_qpn | m.rq_psn | m.max_dest_rd_atomic | m.min_rnr_timer) != 0) return error.VerbsFailed;
                 a = .{ .qp_state = vabi.qps_rts, .timeout = 14, .retry_cnt = 7, .rnr_retry = 7, .sq_psn = n.psns[p], .max_rd_atomic = 1 };
