@@ -62,14 +62,21 @@ pub const LaneHost = struct {
         prefilled: ?i96 = null,
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+        key: []u32 = &.{}, // the prompt as the cache keys it, each image span's tokens made from its bytes (gpa-owned; empty: the prompt)
         kept0: u64 = 0, // the store's kept count when the job looked it up
+
+        /// The tokens the cache keys this request by: the prompt, or with images the prompt whose image spans hold
+        /// tokens made from each image's bytes (past the vocabulary), so two images never share a kept state.
+        fn cacheKey(job: *const Job) []const u32 {
+            return if (job.key.len > 0) job.key else job.request.prompt;
+        }
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.request.images.len > 0) return; // a kept state is keyed by tokens: an image's are its placeholder's
-            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s, job.request.chunks);
+            if (job.request.images.len > 0 and job.key.len == 0) return; // no key made: nothing kept
+            if (job.host.cache) |store| _ = store.keep(job.cacheKey(), at, s, job.request.chunks);
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
@@ -79,7 +86,7 @@ pub const LaneHost = struct {
             const store = job.host.cache orelse return;
             if (!job.started) return;
             job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
-            if (job.stream.reuse_failed) store.resumed(e, job.request.prompt, false) else if (job.stream.cached == e.at) store.resumed(e, job.request.prompt, true);
+            if (job.stream.reuse_failed) store.resumed(e, job.cacheKey(), false) else if (job.stream.cached == e.at) store.resumed(e, job.cacheKey(), true);
         }
     };
 
@@ -221,6 +228,8 @@ pub const LaneHost = struct {
     fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
         job.reported();
         h.gpa.free(job.marks);
+        if (job.key.len > 0) h.gpa.free(job.key);
+        job.key = &.{};
         const s = &job.stream;
         const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
         emit(job, .{ .finished = .{ .reason = reason, .stats = stats, .message = message } });
@@ -306,7 +315,8 @@ pub const LaneHost = struct {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (r.images.len == 0) if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
+        if (r.images.len > 0 and h.cache != null) job.key = imageKey(h.gpa, r) catch &.{};
+        if (r.images.len == 0 or job.key.len > 0) if (h.cache) |store| if (store.lookup(h.gpa, job.cacheKey(), r.history_len, r.shared_prefixes, r.chunks)) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
@@ -433,6 +443,8 @@ pub const LaneHost = struct {
         job.entry = null; // nothing was restored: the store keeps the entry for the next lookup
         h.gpa.free(job.marks);
         job.marks = &.{};
+        if (job.key.len > 0) h.gpa.free(job.key);
+        job.key = &.{};
         job.stream.deinit(h.gpa);
         job.proposer.deinit();
         job.started = false;
@@ -641,3 +653,17 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
 }
 
 test { _ = @import("lane_host_test.zig"); }
+
+/// The prompt cache's key for a request with images: its tokens, each image span's positions holding tokens made from
+/// a hash of that image's prepared bytes (all at or above 2^31, past any vocabulary), so a later turn that carries the
+/// same images resumes its kept state and a different image at the same place never does.
+fn imageKey(gpa: Allocator, r: *const Request) ![]u32 {
+    const key = try gpa.dupe(u32, r.prompt);
+    errdefer gpa.free(key);
+    for (r.images) |img| {
+        if (@as(usize, img.at) + img.tokens > key.len) return error.BadImageSpan;
+        const h = std.hash.Wyhash.hash(0x5eed1a6e, img.bytes);
+        for (key[img.at..][0..img.tokens], 0..) |*t, i| t.* = 0x8000_0000 | @as(u32, @truncate((h +% @as(u64, i) *% 0x9E3779B97F4A7C15) >> 33));
+    }
+    return key;
+}

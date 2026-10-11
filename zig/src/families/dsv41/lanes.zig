@@ -371,8 +371,8 @@ pub const Lanes = struct {
         var moved = false;
         if (s.reuse.saved) |p| {
             const sn: *Snap = @ptrCast(@alignCast(p));
-            // (a kept state knows no images: a prompt with them runs whole and keeps nothing)
-            if (s.images.len == 0 and self.usable(sn, len)) {
+            // a kept state of a prompt with images is keyed by the images' bytes too (lane_host imageKey)
+            if (self.usable(sn, len)) {
                 kept = sn;
                 moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size);
             } else s.reuse_failed = true;
@@ -390,6 +390,8 @@ pub const Lanes = struct {
             _ = self.streams.remove(s);
             self.used[slot] = false;
         }
+        // an image span wholly before the resume point is in the kept state's caches: no tower, no rows
+        const resume_at: usize = if (kept) |sn| sn.at else 0;
         const seq = &self.seqs[slot];
         try seq.resize(gpa, len);
         for (seq.items, ids) |*q, id| q.* = @intCast(id);
@@ -409,6 +411,7 @@ pub const Lanes = struct {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
                     q.* = -1;
                 }
+                if (@as(usize, img.at) + img.tokens <= resume_at) continue;
                 if (img.rows) {
                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                     try rows.appendSlice(gpa, img.bytes);
@@ -484,7 +487,7 @@ pub const Lanes = struct {
             }
             head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
             start += n;
-            if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
+            if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
         }
         if (!head) return error.NoPromptLogits;
         const logits = try m.promptLogitsHost();
