@@ -606,8 +606,6 @@ pub const Lanes = struct {
         }
         const t1 = m.now();
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
-        try m.verify(rows, self.built.absorb[0..windows.len]);
-        const t2 = m.now();
         // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
         var greedy = true;
         for (windows) |w| {
@@ -615,6 +613,10 @@ pub const Lanes = struct {
                 greedy = false;
             };
         }
+        m.early_want = if (greedy) 1 else 2; // (TF_DS_EARLY_READ: copied before the absorb)
+        defer m.early_want = 0;
+        try m.verify(rows, self.built.absorb[0..windows.len]);
+        const t2 = m.now();
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
         const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
         const t3 = m.now();

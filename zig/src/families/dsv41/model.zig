@@ -114,6 +114,12 @@ pub const Model = struct {
     logits: []f32, // round.max_rows rows of logits on the host
     amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
     amax_host: [round.max_rows]u32 = undefined,
+    // TF_DS_EARLY_READ: the round's tokens (1) or logits (2) the next verify copies before its absorb (early_want, set
+    // by the caller), the copy's event and pinned buffer, and what the last verify copied (early_kind)
+    early_want: u8 = 0,
+    early_kind: u8 = 0,
+    early_ev: ?cuda.Event = null,
+    early_buf: ?cuda.HostBuffer = null,
     // the stream a fill is running: its slot and its view of the caches (its extent from base)
     fill_slot: usize = 0,
     // the prompt a fill's chunks come from (the caller's, set for the fill) and the thread reading the next chunk's
@@ -346,6 +352,14 @@ pub const Model = struct {
         m.ids64 = try a.alloc(i64, chunk_rows);
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+        m.early_want = 0;
+        m.early_kind = 0;
+        m.early_ev = null;
+        m.early_buf = null;
+        if (std.c.getenv("TF_DS_EARLY_READ")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
+            m.early_buf = try cuda.HostBuffer.alloc(m.ctx.d, round.max_rows * m.vocab * 4);
+            m.early_ev = try cuda.Event.init(m.ctx.d, false);
+        };
         return m;
     }
 
@@ -734,7 +748,20 @@ pub const Model = struct {
         const e = &m.eng;
         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
         const t0 = m.now();
+        m.early_kind = 0;
         try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null, if (m.graphs) |*g| g else null);
+        if (m.early_buf != null and m.early_want != 0 and !m.prof) {
+            // the reader's copy first (TF_DS_EARLY_READ): roundArgmax / roundLogits wait for its event alone
+            const d = m.ctx.d;
+            const R = rows.ids.len;
+            const dst = m.early_buf.?.bytes.ptr;
+            if (m.early_want == 1) {
+                try m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.amax);
+                try d.check(d.api.cuMemcpyDtoHAsync_v2(dst, m.amax, R * 4, m.stream.handle), "cuMemcpyDtoHAsync");
+            } else try d.check(d.api.cuMemcpyDtoHAsync_v2(dst, m.rd.logits, R * m.vocab * 4, m.stream.handle), "cuMemcpyDtoHAsync");
+            try m.early_ev.?.record(m.stream);
+            m.early_kind = m.early_want;
+        }
         if (m.prof) {
             m.t_enqueue = m.now() - t0;
             try m.stream.synchronize();
@@ -765,7 +792,8 @@ pub const Model = struct {
             }
             if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
         }
-        try m.stream.synchronize();
+        // an early read: the absorb runs on while the host draws (the next pass queues behind it)
+        if (m.early_kind == 0) try m.stream.synchronize();
         if (m.prof) m.t_absorb = m.now() - t1;
     }
 
@@ -800,6 +828,12 @@ pub const Model = struct {
     /// The round's greedy tokens, R rows (the device's argmax of the round's logits, as sampling.argmax), on the host.
     pub fn roundArgmax(m: *Model, R: usize) ![]const u32 {
         const d = m.ctx.d;
+        if (m.early_kind == 1) {
+            m.early_kind = 0;
+            try m.early_ev.?.synchronize();
+            @memcpy(m.amax_host[0..R], m.early_buf.?.slice(u32)[0..R]);
+            return m.amax_host[0..R];
+        }
         try m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.amax);
         try m.stream.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(&m.amax_host, m.amax, R * 4), "cuMemcpyDtoH");
@@ -808,6 +842,11 @@ pub const Model = struct {
 
     pub fn roundLogits(m: *Model, R: usize) ![]const f32 {
         const d = m.ctx.d;
+        if (m.early_kind == 2) {
+            m.early_kind = 0;
+            try m.early_ev.?.synchronize();
+            return m.early_buf.?.slice(f32)[0 .. R * m.vocab];
+        }
         try m.stream.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits, R * m.vocab * 4), "cuMemcpyDtoH");
         return m.logits[0 .. R * m.vocab];
