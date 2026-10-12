@@ -384,7 +384,7 @@ pub const Round = struct {
     /// These ranges touched into L2 behind the work queued so far, on the prefetch stream.
     /// One paced L2 prefetch launch on its stream: `ranges` in order, the last one cut where the launch reaches `budget`
     /// bytes (the served launches move at most 16 MiB, 8 MiB behind wo_b).
-    fn prefetch(rd: *Round, e: *const Engine, ranges: []const [2]u64, budget: u64, site: usize) !void {
+    pub fn prefetch(rd: *Round, e: *const Engine, ranges: []const [2]u64, budget: u64, site: usize) !void {
         const s = rd.pf orelse return;
         var a: ops_mod.Prefetch = .{};
         var left = budget;
@@ -405,7 +405,7 @@ pub const Round = struct {
     }
 
     /// The main stream waits for the prefetches forked so far (a stretch ends joined: its graph's every stream).
-    fn joinPrefetch(rd: *Round, e: *const Engine) !void {
+    pub fn joinPrefetch(rd: *Round, e: *const Engine) !void {
         if (!rd.pf_out) return;
         try e.s.wait(rd.pf_join.?);
         rd.pf_out = false;
@@ -766,7 +766,7 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
 }
 
 /// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
-fn linearBytes(l: weights.Linear) [2]u64 {
+pub fn linearBytes(l: weights.Linear) [2]u64 {
     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
 }
 
@@ -776,10 +776,10 @@ const prefetch_budget: u64 = 16 << 20;
 /// TF_DS_PF_*: the prefetch's delay by site (ns), pace (GB/s) and budget (bytes), read once (usePrefetch).
 var pf_delays: [3]i64 = .{ 3000, 3000, 3000 };
 var pf_rate: f64 = 230.0;
-var pf_budget: u64 = prefetch_budget;
+pub var pf_budget: u64 = prefetch_budget;
 
 /// An mHC mix's weights hc_*_fn: fp32 [24, hc * d].
-fn hcFnBytes(c: anytype) u64 {
+pub fn hcFnBytes(c: anytype) u64 {
     return 24 * @as(u64, c.hc) * c.hidden * 4;
 }
 

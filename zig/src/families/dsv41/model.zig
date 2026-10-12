@@ -304,6 +304,9 @@ pub const Model = struct {
         if (o.drafts) {
             m.dpool = try draft.Pool.init(&m.eng, &m.arena, m.streams);
             m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
+            if (std.c.getenv("TF_DS_DRAFT_PREFETCH")) |v| if (std.mem.eql(u8, std.mem.span(v), "1") and m.rd.pf != null) {
+                m.dr.?.pf_rd = &m.rd;
+            };
             // coupled drafts (TF_DS_COUPLED_DRAFTS=<lambda>, e.g. 0.5; unset or 0: the argmax drafts)
             const lam: f32 = if (std.c.getenv("TF_DS_COUPLED_DRAFTS")) |v| (std.fmt.parseFloat(f32, std.mem.span(v)) catch 0) else 0;
             if (lam > 0 and cuda.kernels.available) {

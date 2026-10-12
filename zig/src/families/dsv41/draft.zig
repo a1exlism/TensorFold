@@ -24,6 +24,7 @@ const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const markov_tokens = @import("markov_tokens.zig");
 const draft2d = @import("draft2d.zig");
+const round = @import("round.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -231,6 +232,8 @@ pub const Drafter = struct {
     // coupled drafts (TF_DS_COUPLED_DRAFTS): the kernels, and whether this pass draws with them (a stream at T > 0)
     coupled: ?Coupled = null,
     coupled_now: bool = false,
+    // TF_DS_DRAFT_PREFETCH: the round whose paced L2 prefetch the pass shares (null: no prefetch in the pass)
+    pf_rd: ?*round.Round = null,
     // TF_DS_MARKOV_ROWS: the cached bias rows at most (mk_cap), filled so far (mk_used); the slot table's host copy and
     // the tokens waiting for their rows (empty mk_host: the 256 rows of load alone)
     mk_cap: usize = 0,
@@ -268,6 +271,7 @@ pub const Drafter = struct {
         dr.steps = 0;
         dr.graphs = null;
         dr.coupled = null;
+        dr.pf_rd = null;
         dr.coupled_now = false;
         dr.mk_cap = 0;
         dr.mk_used = 0;
@@ -557,6 +561,8 @@ pub const Drafter = struct {
             try Probe.check(probe, .attn_in, j, dr.x);
             try Probe.check(probe, .attn_ring, j, pool.rings[j]);
             try dr.attention(e, ch, pool, j, R);
+            // behind wo_b: the FFN mix's weights, the router, the shared expert
+            if (dr.pf_rd) |prd| try prd.prefetch(e, &.{ .{ lay.hc_ffn[0], round.hcFnBytes(c) }, .{ lay.gate_w, @as(u64, lay.experts.count - 1) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, round.pf_budget / 2, 1);
             try Probe.check(probe, .attn_out, j, dr.pa);
             if (e.two) |tw| try tw.pairGather(e, dr.pa, dr.ga, R, d, 4) else try e.gatherF32(dr.pa, dr.ga, R * d);
             try Probe.check(probe, .attn_gather, j, dr.ga);
@@ -564,6 +570,13 @@ pub const Drafter = struct {
             h = try dr.mix(e, h, &spare, &pending, lay.hc_ffn, dr.pre_a, lay.ffn_norm, pre_f, R);
             try Probe.check(probe, .moe_in, j, dr.x);
             try dr.moe(e, j, R);
+            // behind the experts: the next stage's mix and input linears, after the last one the head
+            if (dr.pf_rd) |prd| {
+                if (j + 1 < dr.ds.blocks.len) {
+                    const nx = dr.ds.blocks[j + 1];
+                    try prd.prefetch(e, &.{ .{ nx.hc_attn[0], round.hcFnBytes(c) }, round.linearBytes(nx.wq_a), round.linearBytes(nx.wkv), round.linearBytes(nx.wq_b) }, round.pf_budget, 2);
+                } else try prd.prefetch(e, &.{round.linearBytes(e.w.head)}, round.pf_budget, 2);
+            }
             try Probe.check(probe, .moe_out, j, dr.pm);
             if (e.two) |tw| try tw.pairGather(e, dr.pm, dr.gm, R, d, 4) else try e.gatherF32(dr.pm, dr.gm, R * d);
             try Probe.check(probe, .moe_gather, j, dr.gm);
@@ -578,6 +591,11 @@ pub const Drafter = struct {
         try tri_basic.collapse(t, h, pre, dr.xc, R, d);
         try tri_basic.rmsnorm(t, dr.xc, d, dr.ds.norm, dr.xn, d, c.eps, R, d);
         try prompt.grouped(e, ch, R, &.{e.w.head}, &.{dr.xn}, &.{d}, &.{dr.local}, &.{e.w.head.n}, &.{.f32});
+        // behind the head (the Markov loop's small launches): the next round's first layer, its mix and input linears
+        if (dr.pf_rd) |prd| {
+            const l0 = e.w.layers[0];
+            try prd.prefetch(e, &.{ .{ l0.hc_attn[0], round.hcFnBytes(c) }, round.linearBytes(l0.wq_a), round.linearBytes(l0.wkv), round.linearBytes(l0.wq_b) }, round.pf_budget, 0);
+        }
         try Probe.check(probe, .local, S, dr.local);
         // the Markov loop: out [N, steps + 1], each stream's last token first
         const ts = steps + 1;
@@ -596,6 +614,7 @@ pub const Drafter = struct {
         try e.ops.copyRows(e.s, dr.xcf, d * 4, dr.conf_in, w * 4, d * 4, N * steps);
         try e.ops.copyRows(e.s, dr.ef, rank * 4, dr.conf_in + d * 4, w * 4, rank * 4, N * steps);
         try e.blas.xv(dr.conf_in, dr.confw, dr.conf, N * steps, w);
+        if (dr.pf_rd) |prd| try prd.joinPrefetch(e); // (a pass ends joined: its graph's every stream)
     }
 
     /// pre_mix of _stages_fused: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare
@@ -628,6 +647,13 @@ pub const Drafter = struct {
         try tri_norm.rmsnormRot(t, dr.qa, lay.wq_a.n, lay.q_norm, c.eps, &rot, dr.qr, lay.wq_a.n, R, lay.wq_a.n);
         var qc = [_]exl3_linear.Call{.{ .layer = lay.wq_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = dr.xhq, .y = dr.q, .ldy = @intCast(lay.wq_b.n), .y_dtype = .bf16, .counters = 0, .rope = .{ .cos = rope.cos, .sin = rope.sin, .pos = pos, .hd = @intCast(hd), .rd = @intCast(rd) } }};
         try prompt.groupedRotated(e, ch, R, &qc);
+        // the prefetch: this stage's wo_a and wo_b behind q's linears
+        if (dr.pf_rd) |prd| {
+            var r: [5][2]u64 = @splat(.{ 0, 0 });
+            for (lay.wo_a[0..lay.groups], 0..) |wo, gi| r[gi] = round.linearBytes(wo);
+            r[4] = round.linearBytes(lay.wo_b);
+            try prd.prefetch(e, &r, round.pf_budget, 0);
+        }
         // the block rows' keys: normed and roped, stored nowhere (ring row -1)
         const plane_rows = pool.slots * pool.ring;
         try tri_norm.kvNormRope(t, dr.ykv, lay.kv_norm, rope.cos, rope.sin, pos, pool.rings[j], plane_rows, dr.row(5), c.eps, true, rd, dr.kvb, R, hd);
