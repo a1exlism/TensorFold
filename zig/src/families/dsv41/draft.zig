@@ -116,7 +116,7 @@ pub const PassGraphs = struct {
     gpa: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Key, cuda.graph.Exec) = .empty,
 
-    pub const Key = struct { streams: u32, steps: u32 };
+    pub const Key = struct { streams: u32, steps: u32, coupled: bool };
 
     pub fn init(gpa: std.mem.Allocator) PassGraphs {
         return .{ .gpa = gpa };
@@ -134,7 +134,7 @@ pub const PassGraphs = struct {
     }
 
     fn run(g: *PassGraphs, dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize) !void {
-        const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps) };
+        const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps), .coupled = dr.coupled_now };
         if (g.map.getPtr(key)) |x| return x.launchOn(e.s);
         try cuda.graph.beginCapture(e.s, .thread_local);
         dr.body(e, ch, pool, N, steps, null) catch |err| {
@@ -228,6 +228,9 @@ pub const Drafter = struct {
     arows: u64,
     // the pass's graphs (BatchDraftGraph: one a streams and steps; null: eager)
     graphs: ?*PassGraphs = null,
+    // coupled drafts (TF_DS_COUPLED_DRAFTS): the kernels, and whether this pass draws with them (a stream at T > 0)
+    coupled: ?Coupled = null,
+    coupled_now: bool = false,
     // the last pass on the host: each stream's drafts and confidences (`steps` of them)
     streams: usize = 0,
     steps: usize = 0,
@@ -256,6 +259,8 @@ pub const Drafter = struct {
         dr.streams = 0;
         dr.steps = 0;
         dr.graphs = null;
+        dr.coupled = null;
+        dr.coupled_now = false;
         dr.rows = try a.take(6 * R * 8);
         dr.bidx = try a.take(R * pick_pad * 8);
         dr.wlo = try a.take(8);
@@ -435,12 +440,18 @@ pub const Drafter = struct {
 
     /// BatchDraftGraph.run for N streams (tokens at positions q0 in slots): each stream's `steps` drafts and their
     /// confidences into drafts / confs. Each slot's rings hold its positions before q0 (absorbed).
-    pub fn pass(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, probe: ?Probe) !void {
+    pub fn pass(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, probe: ?Probe, samp: []const DraftSampling) !void {
         const N = tokens.len;
         const n = dr.n;
         const R = N * n;
         if (N == 0 or N > max_streams or R > max_rows or q0.len != N or slots.len != N) return notPorted(@src());
         if (steps == 0 or steps > n) return error.BadDraftPass;
+        // coupled drafts only when a stream samples: at temperature 0 every draw is the argmax anyway
+        dr.coupled_now = false;
+        if (dr.coupled) |*x| {
+            for (samp) |s| dr.coupled_now = dr.coupled_now or s.temperature > 0;
+            if (dr.coupled_now) try x.upload(e, q0, samp);
+        }
         // _body's index rows: ids [token, noise ...], positions q0 + j, window positions q0 - 1, ring bases
         var hv: [6 * max_rows]i64 = @splat(0);
         var hb: [max_rows * pick_pad]i64 = @splat(-1);
@@ -525,7 +536,7 @@ pub const Drafter = struct {
         // the Markov loop: out [N, steps + 1], each stream's last token first
         const ts = steps + 1;
         var g: MarkovGather = .{ .e = e, .dst = dr.mg };
-        try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });
+        if (dr.coupled_now) try dr.coupled.?.steps(dr, e, ts, N, n, steps) else try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });
         try Probe.check(probe, .markov, S, dr.out);
         // the confidence head: [xc (fp32), the embedding rows the steps read (fp32)] @ conf^T, a stream's first steps rows
         const rank = c.markov_rank;
@@ -701,3 +712,126 @@ fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
     return error.NotPortedYet;
 }
+
+/// A drafting stream's sampling, for coupled drafts (temperature 0: the argmax).
+pub const DraftSampling = struct { seed: u64 = 0, temperature: f32 = 0, top_k: i32 = 0, top_p: f32 = 1, min_p: f32 = 0 };
+
+/// Coupled drafts (coupled_draft.cu): each Markov step draws its token with the target's own keyed noise at that
+/// position (sampleRow's rule on the drafter's scores, the noise scaled by lambda) instead of taking the argmax. Each
+/// step: this rank's K best columns, their gather over the ranks, the draw. The per-stream seeds, positions and
+/// sampling settings are uploaded before each pass.
+pub const Coupled = struct {
+    mod: cuda.Module,
+    topk: cuda.Function,
+    pick: cuda.Function,
+    k: usize,
+    lam: f32,
+    send: cuda.DeviceBuffer, // fp32 [max_streams, 2K]
+    gsend: cuda.DeviceBuffer, // fp32 [world, max_streams, 2K]
+    params: cuda.DeviceBuffer, // seed u64 [S], q0 i64 [S], temperature f32 [S], top_k i32 [S], top_p f32 [S], min_p f32 [S]
+
+    pub fn load(d: *const cuda.Driver, image: []const u8, world: usize, lam: f32) !Coupled {
+        var m = try cuda.Module.load(d, image);
+        errdefer m.unload();
+        const k: usize = 32;
+        var send = try cuda.DeviceBuffer.alloc(d, max_streams * 2 * k * 4);
+        errdefer send.free();
+        var gsend = try cuda.DeviceBuffer.alloc(d, world * max_streams * 2 * k * 4);
+        errdefer gsend.free();
+        var params = try cuda.DeviceBuffer.alloc(d, max_streams * (8 + 8 + 4 + 4 + 4 + 4));
+        errdefer params.free();
+        return .{ .mod = m, .topk = try m.function("dsv41_coupled_topk"), .pick = try m.function("dsv41_coupled_pick"), .k = k, .lam = lam, .send = send, .gsend = gsend, .params = params };
+    }
+
+    fn seedAt(x: *const Coupled) u64 {
+        return x.params.ptr;
+    }
+    fn q0At(x: *const Coupled) u64 {
+        return x.params.ptr + max_streams * 8;
+    }
+    fn tempAt(x: *const Coupled) u64 {
+        return x.params.ptr + max_streams * 16;
+    }
+    fn topkAt(x: *const Coupled) u64 {
+        return x.params.ptr + max_streams * 20;
+    }
+    fn toppAt(x: *const Coupled) u64 {
+        return x.params.ptr + max_streams * 24;
+    }
+    fn minpAt(x: *const Coupled) u64 {
+        return x.params.ptr + max_streams * 28;
+    }
+
+    /// The pass's streams' settings (missing ones: the argmax) and positions, before its graph runs. A top_k of 0 (no
+    /// limit) or above K drafts over the K best.
+    pub fn upload(x: *Coupled, e: *const Engine, q0: []const i64, samp: []const DraftSampling) !void {
+        const kk: i32 = @intCast(x.k);
+        var hs: [max_streams]u64 = @splat(0);
+        var hq: [max_streams]i64 = @splat(0);
+        var ht: [max_streams]f32 = @splat(0);
+        var hk: [max_streams]i32 = @splat(kk);
+        var hp: [max_streams]f32 = @splat(1);
+        var hm: [max_streams]f32 = @splat(0);
+        for (q0, 0..) |q, i| {
+            hq[i] = q;
+            if (i < samp.len) {
+                hs[i] = samp[i].seed;
+                ht[i] = samp[i].temperature;
+                hk[i] = if (samp[i].top_k <= 0 or samp[i].top_k > kk) kk else samp[i].top_k;
+                hp[i] = samp[i].top_p;
+                hm[i] = samp[i].min_p;
+            }
+        }
+        var host: [max_streams * 32]u8 = undefined;
+        @memcpy(host[0 .. max_streams * 8], std.mem.sliceAsBytes(&hs));
+        @memcpy(host[max_streams * 8 .. max_streams * 16], std.mem.sliceAsBytes(&hq));
+        @memcpy(host[max_streams * 16 .. max_streams * 20], std.mem.sliceAsBytes(&ht));
+        @memcpy(host[max_streams * 20 .. max_streams * 24], std.mem.sliceAsBytes(&hk));
+        @memcpy(host[max_streams * 24 .. max_streams * 28], std.mem.sliceAsBytes(&hp));
+        @memcpy(host[max_streams * 28 .. max_streams * 32], std.mem.sliceAsBytes(&hm));
+        try prompt.upload(e, x.params.ptr, &host, host.len);
+    }
+
+    /// Markov.steps with coupled draws: out [N, count + 1] int64 (out[:, 0] the last tokens) -> out[:, 1:].
+    pub fn steps(x: *const Coupled, dr: *const Drafter, e: *const Engine, ts: usize, N: usize, block: usize, count: usize) !void {
+        const m = dr.mk;
+        const nc = m.n_cols;
+        const lw = if (m.lg_w != 0) m.lg_w else nc;
+        for (0..count) |i| {
+            const tok = dr.out + 8 * i;
+            try m.bias(e.t, tok, ts, m.slot, dr.msc.stage, m.cols, N);
+            var a: cuda.Args = .{};
+            a.add(dr.local + 4 * i * lw);
+            a.add(@as(c_longlong, @intCast(block * lw)));
+            a.add(tok);
+            a.add(@as(c_int, @intCast(ts)));
+            a.add(m.slot);
+            a.add(m.cache);
+            a.add(@as(c_longlong, @intCast(m.cols)));
+            a.add(dr.msc.stage);
+            a.add(@as(c_longlong, @intCast(m.cols)));
+            a.add(@as(c_int, @intCast(nc)));
+            a.add(@as(c_int, @intCast(m.seg0)));
+            a.add(x.send.ptr);
+            a.add(@as(c_int, @intCast(x.k)));
+            try cuda.launch.launch(x.topk, .{ .grid = .{ .x = @intCast(N), .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 } }, e.s, &a);
+            try e.gatherF32(x.send.ptr, x.gsend.ptr, N * 2 * x.k);
+            a = .{};
+            a.add(x.gsend.ptr);
+            a.add(@as(c_int, @intCast(N)));
+            a.add(@as(c_int, @intCast(e.world)));
+            a.add(@as(c_int, @intCast(x.k)));
+            a.add(dr.out + 8 * (i + 1));
+            a.add(@as(c_int, @intCast(ts)));
+            a.add(x.seedAt());
+            a.add(x.q0At());
+            a.add(@as(c_int, @intCast(i)));
+            a.add(x.tempAt());
+            a.add(x.topkAt());
+            a.add(x.toppAt());
+            a.add(x.minpAt());
+            a.add(x.lam);
+            try cuda.launch.launch(x.pick, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, e.s, &a);
+        }
+    }
+};

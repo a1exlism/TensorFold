@@ -627,6 +627,7 @@ pub const Lanes = struct {
         var q0: [max_streams]i64 = undefined;
         var slots: [max_streams]i64 = undefined;
         var depths: [max_streams]usize = undefined;
+        var samp: [max_streams]draft.DraftSampling = undefined;
         var asked: [max_streams]*Lane = undefined;
         var n: usize = 0;
         var steps: usize = 0;
@@ -641,6 +642,7 @@ pub const Lanes = struct {
             tokens[n] = token;
             q0[n] = @intCast(r.position - 1);
             slots[n] = @intCast(l.slot);
+            samp[n] = if (r.stream.sampling) |sm| .{ .seed = sm.seed, .temperature = @floatCast(sm.temperature), .top_k = @intCast(sm.top_k), .top_p = @floatCast(sm.top_p), .min_p = @floatCast(sm.min_p) } else .{};
             depths[n] = @min(r.depth, block);
             asked[n] = l;
             steps = @max(steps, depths[n]);
@@ -654,11 +656,16 @@ pub const Lanes = struct {
                 try self.wire.int(gpa, i64, tokens[i]);
                 try self.wire.int(gpa, i64, q0[i]);
                 try self.wire.int(gpa, i64, slots[i]);
+                try self.wire.int(gpa, u64, samp[i].seed);
+                try self.wire.int(gpa, u32, @bitCast(samp[i].temperature));
+                try self.wire.int(gpa, i32, samp[i].top_k);
+                try self.wire.int(gpa, u32, @bitCast(samp[i].top_p));
+                try self.wire.int(gpa, u32, @bitCast(samp[i].min_p));
             }
             try self.flush();
         }
         const t0 = m.now();
-        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
+        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, samp[0..n]);
         if (self.prof) |*p| {
             p.pass += m.now() - t0;
             p.passes += 1;
@@ -910,12 +917,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 var tokens: [max_streams]i64 = undefined;
                 var q0: [max_streams]i64 = undefined;
                 var slots: [max_streams]i64 = undefined;
+                var samp: [max_streams]draft.DraftSampling = undefined;
                 for (0..n) |i| {
                     tokens[i] = try r.int(i64);
                     q0[i] = try r.int(i64);
                     slots[i] = try r.int(i64);
+                    samp[i] = .{ .seed = try r.int(u64), .temperature = @bitCast(try r.int(u32)), .top_k = try r.int(i32), .top_p = @bitCast(try r.int(u32)), .min_p = @bitCast(try r.int(u32)) };
                 }
-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
+                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, samp[0..n]) catch |err| refused(err);
             },
             .fill_images => {
                 const count = try r.int(u32);

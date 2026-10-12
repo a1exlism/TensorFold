@@ -298,6 +298,12 @@ pub const Model = struct {
         if (o.drafts) {
             m.dpool = try draft.Pool.init(&m.eng, &m.arena, m.streams);
             m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
+            // coupled drafts (TF_DS_COUPLED_DRAFTS=<lambda>, e.g. 0.5; unset or 0: the argmax drafts)
+            const lam: f32 = if (std.c.getenv("TF_DS_COUPLED_DRAFTS")) |v| (std.fmt.parseFloat(f32, std.mem.span(v)) catch 0) else 0;
+            if (lam > 0 and cuda.kernels.available) {
+                m.dr.?.coupled = try draft.Coupled.load(d, cuda.kernels.dsv41_coupled, sp.world, lam);
+                std.log.info("coupled drafts: lambda {d}", .{lam});
+            }
             if (o.graphs) {
                 m.pgraphs = draft.PassGraphs.init(gpa);
                 m.dr.?.graphs = &m.pgraphs.?;
@@ -817,12 +823,12 @@ pub const Model = struct {
 
     /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold
     /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
-    pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize) !void {
+    pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, samp: []const draft.DraftSampling) !void {
         if (m.dr == null) return error.NoDrafter;
         const dr = &m.dr.?;
         const pool = &m.dpool.?;
         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
-        try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+        try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null, samp);
     }
 };
 
