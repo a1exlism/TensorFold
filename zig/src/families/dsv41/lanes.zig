@@ -28,8 +28,9 @@ const Model = model.Model;
 const max_streams = model.max_streams;
 const max_rows = round.max_rows;
 
-/// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
-pub const window_rows = 6;
+/// A window of the pending row and the drafter's block, or of a copy from the context: up to 16 rows (the sliding
+/// window ring keeps 16 extra slots, so a window never overwrites a key it reads; replies checked identical to 6-row windows).
+pub const window_rows = 16;
 
 /// The image rows a fill_images frame carries at most.
 pub const image_piece = 32 << 10;
