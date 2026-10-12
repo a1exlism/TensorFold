@@ -44,58 +44,11 @@ __device__ __forceinline__ void warp_insert(float& lv, int& li, float s, int g, 
     }
 }
 
-// Program r (1024 threads): row r's scores over this rank's columns, its K best (value desc, id asc) into
-// SEND[r * 2K]: the values in [0, K), the ids (as floats, exact below 2^24) in [K, 2K). Each warp keeps a sorted
-// list of its columns' best (8 chunks of 32 columns offered while the next 8 load), then the lists merge pairwise.
-extern "C" __global__ void __launch_bounds__(1024) dsv41_coupled_topk(const float* __restrict__ LG, long long l_row,
-                                                                      const long long* __restrict__ TOK, int t_stride,
-                                                                      const int* __restrict__ SLOT,
-                                                                      const __half* __restrict__ CACHE, long long c_row,
-                                                                      const __half* __restrict__ STAGE, long long s_row,
-                                                                      int n_cols, int seg0, float* __restrict__ SEND,
-                                                                      int K) {
-    const int r = blockIdx.x;
-    const long long tok = TOK[(long long)r * t_stride];
-    const int slot = SLOT[tok];
-    const __half* brow = slot >= 0 ? CACHE + (long long)slot * c_row : STAGE + (long long)r * s_row;
-    const float* lrow = LG + (long long)r * l_row;
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    if (K > KMAX) K = KMAX;
-    if (K < 1) K = 1;
-    float lv = -INFINITY, tv = -INFINITY;
-    int li = 0x7fffffff, ti = 0x7fffffff;
-    const int gofs = seg0 * n_cols;
-    const int stride = nw * 32 * CD_CH;
-    float a[CD_CH], b[CD_CH];
-    int base = warp * 32 * CD_CH;
-#pragma unroll
-    for (int u = 0; u < CD_CH; ++u) {
-        const int c = base + u * 32 + lane;
-        a[u] = c < n_cols ? lrow[c] : -INFINITY;
-        b[u] = c < n_cols ? __half2float(brow[c]) : 0.f;
-    }
-    for (; base < n_cols; base += stride) {
-        float s[CD_CH];
-#pragma unroll
-        for (int u = 0; u < CD_CH; ++u) s[u] = a[u] + b[u];
-        const int nb = base + stride;
-#pragma unroll
-        for (int u = 0; u < CD_CH; ++u) {
-            const int c = nb + u * 32 + lane;
-            a[u] = c < n_cols ? lrow[c] : -INFINITY;
-            b[u] = c < n_cols ? __half2float(brow[c]) : 0.f;
-        }
-#pragma unroll
-        for (int u = 0; u < CD_CH; ++u) {
-            const int c = base + u * 32 + lane;
-            const int g = c < n_cols ? gofs + c : 0x7fffffff;
-            const float v = c < n_cols ? s[u] : -INFINITY;
-            const unsigned m = __ballot_sync(FULL, before(v, g, tv, ti));
-            if (m) warp_insert(lv, li, v, g, m, K, tv, ti);
-        }
-    }
+// The pairwise merge of a block's warp lists into warp 0's (each list sorted: lane i the i-th best).
+__device__ __forceinline__ void merge_warps(float& lv, int& li, int K, float& tv, int& ti) {
     __shared__ float sv[32 * 32];
     __shared__ int si[32 * 32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
     for (int step = 1; step < nw; step <<= 1) {
         if ((warp & (2 * step - 1)) == step) {
             sv[warp * 32 + lane] = lv;
@@ -110,6 +63,85 @@ extern "C" __global__ void __launch_bounds__(1024) dsv41_coupled_topk(const floa
         }
         __syncthreads();
     }
+}
+
+// Program (b, r) (256 threads): row r's scores over slice b of nb of this rank's columns (whole chunks of 32 x 8),
+// its K best (value desc, id asc) into PART[(r * nb + b) * 2K]: the values in [0, K), the ids (as floats, exact below
+// 2^24) in [K, 2K). Each warp keeps a sorted list of its columns' best (8 chunks of 32 columns offered while the next
+// 8 load), then the block's lists merge pairwise.
+extern "C" __global__ void __launch_bounds__(256) dsv41_coupled_topk_part(const float* __restrict__ LG, long long l_row,
+                                                                          const long long* __restrict__ TOK, int t_stride,
+                                                                          const int* __restrict__ SLOT,
+                                                                          const __half* __restrict__ CACHE, long long c_row,
+                                                                          const __half* __restrict__ STAGE, long long s_row,
+                                                                          int n_cols, int seg0, float* __restrict__ PART,
+                                                                          int K, int nb) {
+    const int r = blockIdx.y, bl = blockIdx.x;
+    const long long tok = TOK[(long long)r * t_stride];
+    const int slot = SLOT[tok];
+    const __half* brow = slot >= 0 ? CACHE + (long long)slot * c_row : STAGE + (long long)r * s_row;
+    const float* lrow = LG + (long long)r * l_row;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    if (K > KMAX) K = KMAX;
+    if (K < 1) K = 1;
+    float lv = -INFINITY, tv = -INFINITY;
+    int li = 0x7fffffff, ti = 0x7fffffff;
+    const int gofs = seg0 * n_cols;
+    const int chunk = 32 * CD_CH;
+    const int span = ((n_cols + nb - 1) / nb + chunk - 1) / chunk * chunk;
+    const int c_lo = bl * span;
+    const int c_hi = min(n_cols, c_lo + span);
+    const int stride = nw * chunk;
+    float a[CD_CH], b[CD_CH];
+    int base = c_lo + warp * chunk;
+#pragma unroll
+    for (int u = 0; u < CD_CH; ++u) {
+        const int c = base + u * 32 + lane;
+        a[u] = c < c_hi ? lrow[c] : -INFINITY;
+        b[u] = c < c_hi ? __half2float(brow[c]) : 0.f;
+    }
+    for (; base < c_hi; base += stride) {
+        float s[CD_CH];
+#pragma unroll
+        for (int u = 0; u < CD_CH; ++u) s[u] = a[u] + b[u];
+        const int nx = base + stride;
+#pragma unroll
+        for (int u = 0; u < CD_CH; ++u) {
+            const int c = nx + u * 32 + lane;
+            a[u] = c < c_hi ? lrow[c] : -INFINITY;
+            b[u] = c < c_hi ? __half2float(brow[c]) : 0.f;
+        }
+#pragma unroll
+        for (int u = 0; u < CD_CH; ++u) {
+            const int c = base + u * 32 + lane;
+            const int g = c < c_hi ? gofs + c : 0x7fffffff;
+            const float v = c < c_hi ? s[u] : -INFINITY;
+            const unsigned m = __ballot_sync(FULL, before(v, g, tv, ti));
+            if (m) warp_insert(lv, li, v, g, m, K, tv, ti);
+        }
+    }
+    merge_warps(lv, li, K, tv, ti);
+    if (warp == 0 && lane < K) {
+        float* o = PART + ((long long)r * nb + bl) * 2 * K;
+        o[lane] = lv;
+        o[K + lane] = (float)li;
+    }
+}
+
+// Program r (32 x nb threads): row r's nb slice lists (PART[(r * nb + b) * 2K], each sorted) merged pairwise, warp
+// b loading slice b, into SEND[r * 2K] (values, then ids as floats).
+extern "C" __global__ void __launch_bounds__(1024) dsv41_coupled_topk_merge(const float* __restrict__ PART, int nb, int K,
+                                                                            float* __restrict__ SEND) {
+    const int r = blockIdx.x;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (K > KMAX) K = KMAX;
+    if (K < 1) K = 1;
+    const float* p = PART + ((long long)r * nb + warp) * 2 * K;
+    float lv = lane < K ? p[lane] : -INFINITY;
+    int li = lane < K ? (int)p[K + lane] : 0x7fffffff;
+    float tv = __shfl_sync(FULL, lv, K - 1);
+    int ti = __shfl_sync(FULL, li, K - 1);
+    merge_warps(lv, li, K, tv, ti);
     if (warp == 0 && lane < K) {
         SEND[(long long)r * 2 * K + lane] = lv;
         SEND[(long long)r * 2 * K + K + lane] = (float)li;

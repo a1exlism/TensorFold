@@ -769,24 +769,31 @@ pub const DraftSampling = struct { seed: u64 = 0, temperature: f32 = 0, top_k: i
 pub const Coupled = struct {
     mod: cuda.Module,
     topk: cuda.Function,
+    merge: cuda.Function,
     pick: cuda.Function,
     k: usize,
     lam: f32,
+    part: cuda.DeviceBuffer, // fp32 [max_streams, slices, 2K]: each column slice's K best
     send: cuda.DeviceBuffer, // fp32 [max_streams, 2K]
     gsend: cuda.DeviceBuffer, // fp32 [world, max_streams, 2K]
     params: cuda.DeviceBuffer, // seed u64 [S], q0 i64 [S], temperature f32 [S], top_k i32 [S], top_p f32 [S], min_p f32 [S]
+
+    /// A step's top-K: column slices a row (a block each), then one block a row merges their lists.
+    const slices: usize = 32;
 
     pub fn load(d: *const cuda.Driver, image: []const u8, world: usize, lam: f32) !Coupled {
         var m = try cuda.Module.load(d, image);
         errdefer m.unload();
         const k: usize = 32;
+        var part = try cuda.DeviceBuffer.alloc(d, max_streams * slices * 2 * k * 4);
+        errdefer part.free();
         var send = try cuda.DeviceBuffer.alloc(d, max_streams * 2 * k * 4);
         errdefer send.free();
         var gsend = try cuda.DeviceBuffer.alloc(d, world * max_streams * 2 * k * 4);
         errdefer gsend.free();
         var params = try cuda.DeviceBuffer.alloc(d, max_streams * (8 + 8 + 4 + 4 + 4 + 4));
         errdefer params.free();
-        return .{ .mod = m, .topk = try m.function("dsv41_coupled_topk"), .pick = try m.function("dsv41_coupled_pick"), .k = k, .lam = lam, .send = send, .gsend = gsend, .params = params };
+        return .{ .mod = m, .topk = try m.function("dsv41_coupled_topk_part"), .merge = try m.function("dsv41_coupled_topk_merge"), .pick = try m.function("dsv41_coupled_pick"), .k = k, .lam = lam, .part = part, .send = send, .gsend = gsend, .params = params };
     }
 
     fn seedAt(x: *const Coupled) u64 {
@@ -858,9 +865,16 @@ pub const Coupled = struct {
             a.add(@as(c_longlong, @intCast(m.cols)));
             a.add(@as(c_int, @intCast(nc)));
             a.add(@as(c_int, @intCast(m.seg0)));
-            a.add(x.send.ptr);
+            a.add(x.part.ptr);
             a.add(@as(c_int, @intCast(x.k)));
-            try cuda.launch.launch(x.topk, .{ .grid = .{ .x = @intCast(N), .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 } }, e.s, &a);
+            a.add(@as(c_int, @intCast(slices)));
+            try cuda.launch.launch(x.topk, .{ .grid = .{ .x = @intCast(slices), .y = @intCast(N), .z = 1 }, .block = .{ .x = 256, .y = 1, .z = 1 } }, e.s, &a);
+            a = .{};
+            a.add(x.part.ptr);
+            a.add(@as(c_int, @intCast(slices)));
+            a.add(@as(c_int, @intCast(x.k)));
+            a.add(x.send.ptr);
+            try cuda.launch.launch(x.merge, .{ .grid = .{ .x = @intCast(N), .y = 1, .z = 1 }, .block = .{ .x = @intCast(32 * slices), .y = 1, .z = 1 } }, e.s, &a);
             try e.gatherF32(x.send.ptr, x.gsend.ptr, N * 2 * x.k);
             a = .{};
             a.add(x.gsend.ptr);
