@@ -71,21 +71,67 @@ fn before(va: f32, ia: i64, vb: f32, ib: i64) bool {
 /// orders it.
 pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) usize {
     const k = @min(count, row.len);
+    if (k == 0) return 0;
+    const lanes = 16;
     var n: usize = 0;
-    for (row, 0..) |v, i| {
-        const id: i64 = @intCast(i);
-        if (n == k and !before(v, id, values[k - 1], ids[k - 1])) continue;
-        // insert in order, dropping the last when full
-        var j: usize = if (n < k) n else k - 1;
-        while (j > 0 and before(v, id, values[j - 1], ids[j - 1])) : (j -= 1) {
-            values[j] = values[j - 1];
-            ids[j] = ids[j - 1];
+    var i: usize = 0;
+    while (i < row.len) {
+        // a whole block under the full list's last value (or NaN) has no candidate: skip it
+        if (n == k and i + lanes <= row.len) {
+            const v: @Vector(lanes, f32) = row[i..][0..lanes].*;
+            const last: @Vector(lanes, f32) = @splat(values[k - 1]);
+            if (!@reduce(.Or, v >= last)) {
+                i += lanes;
+                continue;
+            }
         }
-        values[j] = v;
-        ids[j] = id;
-        if (n < k) n += 1;
+        const end = @min(row.len, i + lanes);
+        while (i < end) : (i += 1) {
+            const v = row[i];
+            const id: i64 = @intCast(i);
+            if (n == k and !before(v, id, values[k - 1], ids[k - 1])) continue;
+            // insert in order, dropping the last when full
+            var j: usize = if (n < k) n else k - 1;
+            while (j > 0 and before(v, id, values[j - 1], ids[j - 1])) : (j -= 1) {
+                values[j] = values[j - 1];
+                ids[j] = ids[j - 1];
+            }
+            values[j] = v;
+            ids[j] = id;
+            if (n < k) n += 1;
+        }
     }
     return n;
+}
+
+test "topCandidates skips blocks and keeps the scan's candidates and order" {
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    var row: [5003]f32 = undefined;
+    for (&row) |*x| x.* = @floatFromInt(r.intRangeAtMost(i32, -400, 400));
+    row[100] = std.math.nan(f32);
+    row[4000] = 400;
+    var va: [28]f32 = undefined;
+    var ia: [28]i64 = undefined;
+    const n = topCandidates(&row, 28, &va, &ia);
+    // the reference: a plain scan
+    var vb: [28]f32 = undefined;
+    var ib: [28]i64 = undefined;
+    var m: usize = 0;
+    for (row, 0..) |v, i| {
+        const id: i64 = @intCast(i);
+        if (m == 28 and !before(v, id, vb[27], ib[27])) continue;
+        var j: usize = if (m < 28) m else 27;
+        while (j > 0 and before(v, id, vb[j - 1], ib[j - 1])) : (j -= 1) {
+            vb[j] = vb[j - 1];
+            ib[j] = ib[j - 1];
+        }
+        vb[j] = v;
+        ib[j] = id;
+        if (m < 28) m += 1;
+    }
+    try std.testing.expectEqual(m, n);
+    try std.testing.expectEqualSlices(i64, ib[0..m], ia[0..n]);
 }
 
 /// The first index of the largest value (np.argmax / torch.argmax on a row without NaN).
