@@ -10,10 +10,10 @@
     ],
     [
      "Content-Length",
-     "215"
+     "185"
     ]
    ],
-   "body": "{\"error\": {\"message\": \"include is not supported (reasoning.encrypted_content): reasoning comes as text in its reasoning item, and nothing is encrypted\", \"type\": \"invalid_request_error\", \"param\": null, \"code\": null}}",
+   "body": "{\"error\": {\"message\": \"include message.output_text.logprobs is not supported: only reasoning.encrypted_content is served\", \"type\": \"invalid_request_error\", \"param\": null, \"code\": null}}",
    "interim": ""
   }
  ]

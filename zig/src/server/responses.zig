@@ -185,7 +185,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     base.put(a, "output", .{ .array = &.{} }) catch return;
     base.put(a, "usage", .null) catch return;
     for (t.echo.keys(), t.echo.values()) |k, v| base.put(a, k, v) catch return;
-    var reply: Reply = .{ .srv = srv, .a = a, .conn = conn, .base = base, .streaming = t.stream, .keep = t.store, .added = t.added, .cx = &cx };
+    var reply: Reply = .{ .srv = srv, .a = a, .conn = conn, .base = base, .streaming = t.stream, .keep = t.store, .encrypted = t.encrypted, .added = t.added, .cx = &cx };
     var out: Wire = .{ .reply = &reply };
     openai.run(srv, a, out.out(), .{ .conn = conn }, true, t.chat);
     if (out.opened or conn.broken) return;
@@ -233,6 +233,7 @@ const Reply = struct {
     base: *json.Object,
     streaming: bool,
     keep: bool,
+    encrypted: bool,
     added: []Value,
     cx: *Cx,
     items: std.ArrayList(*json.Object) = .empty,
@@ -334,6 +335,7 @@ const Reply = struct {
                 try r.event("response.output_text.done", &.{ .{ "item_id", where_id }, .{ "output_index", where_index }, .{ "content_index", .{ .int = "0" } }, .{ "text", part.get("text").? }, .{ "logprobs", .{ .array = &.{} } } });
             } else {
                 try r.event("response.reasoning_text.done", &.{ .{ "item_id", where_id }, .{ "output_index", where_index }, .{ "content_index", .{ .int = "0" } }, .{ "text", part.get("text").? } });
+                if (r.encrypted) try r.put(item, "encrypted_content", .{ .string = translate_mod.seal(r.a, part.get("text").?.string) catch return error.Closed });
             }
             try r.event("response.content_part.done", &.{ .{ "item_id", where_id }, .{ "output_index", where_index }, .{ "content_index", .{ .int = "0" } }, .{ "part", .{ .object = part } } });
         }

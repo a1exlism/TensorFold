@@ -24,7 +24,32 @@ pub const Request = struct {
     added: []Value,
     store: bool,
     stream: bool,
+    encrypted: bool,
 };
+
+/// include's one served value: each reasoning item also carries its text as ``encrypted_content``.
+pub const encrypted_include = "reasoning.encrypted_content";
+const sealed_prefix = "tf-reasoning-v1:";
+
+/// A reasoning text as an ``encrypted_content`` value: base64 behind a marker, not encrypted.
+pub fn seal(a: Allocator, text: []const u8) error{OutOfMemory}![]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const out = try a.alloc(u8, sealed_prefix.len + enc.calcSize(text.len));
+    @memcpy(out[0..sealed_prefix.len], sealed_prefix);
+    _ = enc.encode(out[sealed_prefix.len..], text);
+    return out;
+}
+
+/// The reasoning text of an ``encrypted_content`` value ``seal`` made; null for any other value.
+pub fn unseal(a: Allocator, value: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, value, sealed_prefix)) return null;
+    const dec = std.base64.standard.Decoder;
+    const body = value[sealed_prefix.len..];
+    const n = dec.calcSizeForSlice(body) catch return null;
+    const out = a.alloc(u8, n) catch return null;
+    dec.decode(out, body) catch return null;
+    return out;
+}
 
 fn kindOf(v: Value) ?Value {
     return if (v == .object) v.get("type") else null;
@@ -154,7 +179,10 @@ pub fn messages(cx: *Cx, items: []const Value) errors.Refused![]Value {
                 any = true;
                 if (p.strField("text")) |t| try texts.appendSlice(a, t);
             };
-            if (json.truthyField(item, "encrypted_content") and !any) return cx.refuse("encrypted reasoning is not supported: send the reasoning item's content");
+            if (!any) if (item.strField("encrypted_content")) |sealed| if (sealed.len > 0) {
+                const text = unseal(a, sealed) orelse return cx.refuse("encrypted reasoning from another server is not supported: send the reasoning item's content");
+                try texts.appendSlice(a, text);
+            };
             thought = if (texts.items.len > 0) texts.items else null;
         } else return cx.fail(.request, "input items of type {s} are not supported: send messages, function_call, function_call_output and reasoning items", .{try pyrepr.repr(a, kind)});
     }
@@ -254,15 +282,20 @@ pub fn translate(cx: *Cx, body: Value, history: anytype) errors.Refused!Request 
     if (body != .object) return cx.refuse("the request body must be a JSON object");
     try fields.probabilityOptions(cx, body);
     for (refused) |r| if (json.truthyField(body, r[0])) return cx.refuse(r[1]);
+    var encrypted = false;
     if (body.get("include")) |inc| if (inc.truthy()) {
         var parts: std.ArrayList([]const u8) = .empty;
         switch (inc) {
-            .array => |items| for (items) |i| try parts.append(a, try tool_specs.pyStr(a, i)),
+            .array => |items| for (items) |i| {
+                if (i == .string and std.mem.eql(u8, i.string, encrypted_include)) {
+                    encrypted = true;
+                } else try parts.append(a, try tool_specs.pyStr(a, i));
+            },
             .object => |o| for (o.keys()) |k| try parts.append(a, k),
             .string => |s| for (0..s.len) |i| try parts.append(a, s[i .. i + 1]),
             else => try parts.append(a, try tool_specs.pyStr(a, inc)),
         }
-        return cx.fail(.request, "include is not supported ({s}): reasoning comes as text in its reasoning item, and nothing is encrypted", .{try std.mem.join(a, ", ", parts.items)});
+        if (parts.items.len > 0) return cx.fail(.request, "include {s} is not supported: only {s} is served", .{ try std.mem.join(a, ", ", parts.items), encrypted_include });
     };
     if (body.field("truncation")) |t| if (!(t == .string and std.mem.eql(u8, t.string, "disabled"))) return cx.refuse("truncation must be \"disabled\": a prompt too long for the context is refused");
     if (json.truthyField(body, "top_logprobs")) return cx.refuse("top_logprobs is not supported");
@@ -340,5 +373,5 @@ pub fn translate(cx: *Cx, body: Value, history: anytype) errors.Refused!Request 
     try echo.put(a, "truncation", .{ .string = "disabled" });
     try echo.put(a, "user", body.get("user") orelse .null);
     try echo.put(a, "background", .{ .bool = false });
-    return .{ .chat = .{ .object = chat }, .echo = echo, .added = added, .store = store, .stream = json.truthyField(body, "stream") };
+    return .{ .chat = .{ .object = chat }, .echo = echo, .added = added, .store = store, .stream = json.truthyField(body, "stream"), .encrypted = encrypted };
 }
