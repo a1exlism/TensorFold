@@ -283,11 +283,12 @@ pub fn translate(cx: *Cx, body: Value, count: bool) errors.Refused!Value {
     try kwargs.put(a, "enable_thinking", .{ .bool = enabled });
     try chat.put(a, "chat_template_kwargs", .{ .object = kwargs });
     if (!enabled) try chat.put(a, "reasoning_effort", .{ .string = "none" });
-    if (std.mem.eql(u8, t, "enabled")) {
-        const budget = positiveInt(thinking.get("budget_tokens"));
+    // enabled without budget_tokens: thinking on, no budget
+    if (std.mem.eql(u8, t, "enabled")) if (thinking.get("budget_tokens")) |given| {
+        const budget = positiveInt(given);
         const limit = if (body.get("max_tokens")) |m| m.int64() orelse std.math.maxInt(i64) else 0;
         if (budget == null or (!count and budget.? >= limit)) return cx.refuse("thinking.budget_tokens must be positive and less than max_tokens");
-        try chat.put(a, "thinking_budget", thinking.get("budget_tokens").?);
-    }
+        try chat.put(a, "thinking_budget", given);
+    };
     return .{ .object = chat };
 }
