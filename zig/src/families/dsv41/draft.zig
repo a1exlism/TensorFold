@@ -232,6 +232,7 @@ pub const Drafter = struct {
     // coupled drafts (TF_DS_COUPLED_DRAFTS): the kernels, and whether this pass draws with them (a stream at T > 0)
     coupled: ?Coupled = null,
     coupled_now: bool = false,
+    tail_skip: bool = false,
     // TF_DS_DRAFT_PREFETCH: the round whose paced L2 prefetch the pass shares (null: no prefetch in the pass)
     pf_rd: ?*round.Round = null,
     // TF_DS_MARKOV_ROWS: the cached bias rows at most (mk_cap), filled so far (mk_used); the slot table's host copy and
@@ -273,6 +274,7 @@ pub const Drafter = struct {
         dr.coupled = null;
         dr.pf_rd = null;
         dr.coupled_now = false;
+        dr.tail_skip = if (std.c.getenv("TF_DS_DRAFT_TAIL_SKIP")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         dr.mk_cap = 0;
         dr.mk_used = 0;
         dr.mk_host = &.{};
@@ -569,7 +571,7 @@ pub const Drafter = struct {
             pending = dr.ga;
             h = try dr.mix(e, h, &spare, &pending, lay.hc_ffn, dr.pre_a, lay.ffn_norm, pre_f, R);
             try Probe.check(probe, .moe_in, j, dr.x);
-            try dr.moe(e, j, R);
+            try dr.moe(e, j, R, steps);
             // behind the experts: the next stage's mix and input linears, after the last one the head
             if (dr.pf_rd) |prd| {
                 if (j + 1 < dr.ds.blocks.len) {
@@ -699,9 +701,9 @@ pub const Drafter = struct {
     }
 
     /// Model.moe(lay, x, topk) of a pass's rows: the gate's chunk sums (rowmm_gate; past decode_rows rows the gate's fp32
-    /// matmul), the routing at the stages' top-k with the shared expert in every row's last slot, the routed experts'
-    /// decode path on the stages' own scratch.
-    fn moe(dr: *Drafter, e: *const Engine, j: usize, R: usize) !void {
+    /// matmul), routing the stages' top-k and shared expert on the stages' own scratch. With tail_skip, the last
+    /// stage of a pass under exact_rows rows leaves each stream's rows past steps unrouted.
+    fn moe(dr: *Drafter, e: *const Engine, j: usize, R: usize, steps: usize) !void {
         const c = e.c;
         const lay = dr.ds.blocks[j];
         const ne: usize = lay.experts.count - 1;
@@ -714,6 +716,14 @@ pub const Drafter = struct {
             try e.blas.xwT(dr.xf, dr.gate_f[j], dr.gl, R, c.hidden, ne);
         }
         try tri_norm.route(e.t, dr.gl, kc, lay.gate_b, dr.topk, c.routed_scaling, lay.experts.count - 1, dr.pick, dr.mw, R, ne, dr.slots_moe);
+        if (dr.tail_skip and j + 1 == dr.ds.blocks.len and steps < dr.n and R < exl3_experts.exact_rows) {
+            const bytes = (dr.n - steps) * dr.slots_moe * 4;
+            for (0..R / dr.n) |i| {
+                const off = (i * dr.n + steps) * dr.slots_moe * 4;
+                try prompt.fill(e, dr.pick + off, 0xff, bytes);
+                try prompt.fill(e, dr.mw + off, 0, bytes);
+            }
+        }
         // routed(): fewer than EXACT_ROWS rows take the decode window's fused path, more the chunk's (13+ streams)
         if (R < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, dr.xsd, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
         try exl3_experts.prompt(e.ex, e.s, lay.experts, dr.xs, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);

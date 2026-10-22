@@ -20,6 +20,7 @@
 //!   TF_DS_ENGRAM_AIO=1                          a round's Engram reads by Linux AIO on O_DIRECT
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_IMAGE_CACHE_MIB=N                     the prepared images' cache, N MiB at most (unset or 0: off)
+//!   TF_DS_DRAFT_TAIL_SKIP=1                     the drafter's last stage routes no experts for rows past its steps
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
