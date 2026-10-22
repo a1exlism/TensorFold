@@ -31,6 +31,7 @@ const engram_io = @import("engram_io.zig");
 const engram_aio = @import("engram_aio.zig");
 const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
+const index_split = @import("index_split.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const prompt2d = @import("prompt2d.zig");
 const rdma = @import("rdma.zig");
@@ -120,6 +121,7 @@ pub const Engine = struct {
     c: *const Config,
     w: *const weights.Weights,
     world: usize,
+    index_split: index_split.Settings = .{},
     plain: Rope,
     compressed: Rope,
     round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
@@ -221,6 +223,7 @@ pub const Chunk = struct {
     score: u64 = 0, // fp32 [rows of a block, n_comp]: the candidate pool's layers' index scores
     tmax: u64 = 0, // int64 [rows of a block, cdiv(n_comp, 64)]
     cidx: u64 = 0, // int64 [cap, index_topk]: the selected latents
+    cidx_g: u64 = 0, // int64 [2, cap, index_topk]: the gathered row selections
     max_comp: usize = 0,
     // the candidate pool past candidate_blocks blocks (model.py _candidates, apply_candidates): the chunk's block mask
     // (u8 [pool_rows, pool_ms]), a row block's block maxima (fp32) and their top blocks (int64 [rows, candidate_blocks]), a
@@ -288,6 +291,7 @@ pub const Chunk = struct {
         ch.n = 0;
         ch.start = 0;
         ch.pending = false;
+        ch.cidx_g = 0;
         ch.ids = try a.take(cap * 8);
         ch.pos0 = try a.take(cap * 8);
         ch.pos = ch.pos0;
@@ -354,6 +358,7 @@ pub const Chunk = struct {
             ch.score = try a.take(ke * 4);
             ch.tmax = try a.take((ke / tri_index.tile + cap) * 8);
             ch.cidx = try a.take(cap * c.index_topk * 8);
+            if (e.index_split.enabled and e.comm.world == 2) ch.cidx_g = try a.take(2 * cap * c.index_topk * 8);
             ch.ktop = try a.take(cap * c.index_topk * 8);
             ch.cidxp = try a.take(cap * (c.index_topk + 16) * 8);
             // the pool: only past candidate_blocks blocks, so a row block holds at most key_elems / 2048 rows there
@@ -972,8 +977,15 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     // (the newest block pinned to +inf) pick the pool's cand_blocks blocks (topk_indices: ties to the lower block), the
     // picked blocks with a finite maximum make the chunk's mask, and the later layers' scores outside it become -inf.
     const pk = @min(c.candidate_blocks, nbk);
+    const split = e.index_split.plan(n, rb, e.comm.world, li < c.layers / 2 and li < c.candidate_source and c.kv_sources.has(li) and c.index_sources.has(li));
+    if (split != null and ch.cidx_g == 0) return error.ChunkTooLong;
     var r0: usize = 0;
     while (r0 < n) : (r0 += rb) {
+        if (split) |s| {
+            const spans = s.spans(e.comm.rank);
+            if (!(r0 >= spans[0].row and r0 < spans[0].row + spans[0].rows) and
+                !(r0 >= spans[1].row and r0 < spans[1].row + spans[1].rows)) continue;
+        }
         // the block's rows: iq[r0:r1] and wts[r0:r1] as views (their offsets the served pointers'), vis[r0:r1] at a
         // 16-byte-aligned address (visBlock), its selection into cidx[r0:r1]
         const m = @min(n, r0 + rb) - r0;
@@ -997,6 +1009,17 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
             }
             try e.ops.topkIndices(e.s, ch.score, n_comp_end, m, n_comp_end, kk, vr, out);
         }
+    }
+    if (split) |s| {
+        const row_bytes = kk * 8;
+        try fill(e, ch.ktop, 0xff, s.send_rows * row_bytes);
+        for (s.spans(e.comm.rank)) |sp| {
+            try e.ops.copyRows(e.s, ch.cidx + sp.row * row_bytes, row_bytes, ch.ktop + sp.local * row_bytes, row_bytes, row_bytes, sp.rows);
+        }
+        try e.comm.allGather(ch.ktop, ch.cidx_g, s.send_rows * kk, .i64, e.s);
+        for (0..2) |rank| for (s.spans(rank)) |sp| {
+            try e.ops.copyRows(e.s, ch.cidx_g + sp.gathered * row_bytes, row_bytes, ch.cidx + sp.row * row_bytes, row_bytes, row_bytes, sp.rows);
+        };
     }
     if (pooled and li == c.candidate_source) sh.pool = true;
     sh.kk = kk;

@@ -24,6 +24,7 @@ pub const elf = @import("elf.zig");
 pub const exl3_linear = @import("exl3_linear.zig");
 pub const tri_norm = @import("tri_norm.zig");
 pub const tri_index = @import("tri_index.zig");
+pub const index_split = @import("index_split.zig");
 pub const tri_attn = @import("tri_attn.zig");
 pub const tri_markov = @import("tri_markov.zig");
 pub const tri_hc = @import("tri_hc.zig");
@@ -70,6 +71,7 @@ test {
     refAll(exl3_linear);
     refAll(tri_norm);
     refAll(tri_index);
+    refAll(index_split);
     refAll(tri_attn);
     refAll(tri_markov);
     refAll(tri_hc);

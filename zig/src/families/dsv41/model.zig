@@ -288,6 +288,22 @@ pub const Model = struct {
             }
         }
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+        if (o.world == 2) {
+            if (std.c.getenv("TF_DS_INDEX_SPLIT")) |v| m.eng.index_split.enabled = std.mem.eql(u8, std.mem.span(v), "1");
+            if (std.c.getenv("TF_DS_INDEX_SPLIT_MIN_ROWS")) |v| m.eng.index_split.min_rows = std.fmt.parseInt(usize, std.mem.span(v), 10) catch m.eng.index_split.min_rows;
+            const settings = [2]u64{ @intFromBool(m.eng.index_split.enabled), if (m.eng.index_split.enabled) m.eng.index_split.min_rows else 0 };
+            var buf = try cuda.DeviceBuffer.alloc(d, 3 * @sizeOf(@TypeOf(settings)));
+            defer buf.free();
+            try buf.upload(0, std.mem.asBytes(&settings));
+            try m.comm.allGather(buf.ptr, buf.ptr + @sizeOf(@TypeOf(settings)), settings.len, .u64, m.stream);
+            try m.stream.synchronize();
+            var all: [2][2]u64 = undefined;
+            try buf.download(@sizeOf(@TypeOf(settings)), std.mem.asBytes(&all));
+            if (!std.mem.eql(u64, &all[0], &all[1])) {
+                std.log.err("TF_DS_INDEX_SPLIT and TF_DS_INDEX_SPLIT_MIN_ROWS differ between ranks", .{});
+                return error.IndexSplitMismatch;
+            }
+        }
         if (std.c.getenv("TF_DS_TOPK_TAU")) |v| m.eng.topk_tau = std.fmt.parseFloat(f32, std.mem.span(v)) catch 0;
         if (std.c.getenv("TF_DS_TOPK_MIN")) |v| m.eng.topk_min = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 4;
         if (std.c.getenv("TF_DS_TOPK_RENORM")) |v| m.eng.topk_renorm = !std.mem.eql(u8, std.mem.span(v), "0");
