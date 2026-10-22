@@ -126,6 +126,7 @@ pub const Model = struct {
     // Engram rows during this one (fillChunk), joined before the prompt can change (joinAhead)
     fill_seq: []const i32 = &.{},
     ahead: ?std.Thread = null,
+    reuse_ahead: bool = false,
     view: prompt.Caches = undefined,
     // the filling prompt's image spans and their rows (setImages; cleared by fillBegin)
     spans: std.ArrayList(prompt.Span) = .empty,
@@ -170,6 +171,7 @@ pub const Model = struct {
         if (m.round_ms.len == 0) return error.BadRoundMs;
         m.pool_cap = o.pool;
         m.fill_slot = 0;
+        m.reuse_ahead = false;
         m.prof = false;
         m.timer = null;
         m.ptimer = null;
@@ -623,6 +625,11 @@ pub const Model = struct {
         m.view = try m.caches.view(&m.eng, slot, base);
         for (m.rings, m.ring_view) |r, *v| v.* = r + slot * m.eng.ringBytes();
         m.fill_slot = slot;
+        m.reuse_ahead = false;
+        if (m.eh) |*eh| {
+            eh.ahead_ready = .{ false, false };
+            eh.ahead_err = null;
+        }
     }
 
     /// The prompt's chunk of n rows from position `start` (seq: the stream's ids through the chunk's end) through every
@@ -647,11 +654,13 @@ pub const Model = struct {
         const taps = m.dr != null;
         var floor: usize = 0;
         var kv_done: ?usize = null;
-        // Engram rows read ahead on a thread while the GPU runs the layers before them (the served reader pool's
-        // overlap): this chunk's both layers' during the chunk before it (m.ahead), else the first layer's from the
-        // chunk's start and the next's once the first is applied
+        // Engram rows read ahead while the GPU runs the layers before them: both layers' from the preceding chunk,
+        // including ready rows retained across a decode, else the first layer's from this chunk's start and the next's
+        // once the first is applied
         var ahead: ?std.Thread = m.ahead;
         m.ahead = null;
+        const reuse_ahead = m.reuse_ahead;
+        m.reuse_ahead = false;
         defer if (ahead) |th| th.join();
         if (m.eh) |*eh| {
             if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
@@ -659,11 +668,15 @@ pub const Model = struct {
                 ahead = null;
             }
             if (ahead == null) {
-                eh.ahead_start = start;
-                eh.ahead_n = n;
-                eh.ahead_ready = .{ false, false };
-                eh.ahead_err = null;
-                ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, @as(usize, 0) }) catch null;
+                const matches = reuse_ahead and eh.ahead_start == start and eh.ahead_n == n;
+                const ne = @min(2, c.engram_layers.slice().len);
+                if (!matches or !std.mem.allEqual(bool, eh.ahead_ready[0..ne], true)) {
+                    eh.ahead_start = start;
+                    eh.ahead_n = n;
+                    eh.ahead_ready = .{ false, false };
+                    eh.ahead_err = null;
+                    ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, @as(usize, 0) }) catch null;
+                }
             }
         }
         for (0..c.layers) |li| {
@@ -748,6 +761,9 @@ pub const Model = struct {
     /// eager absorb: rows past the ones the round keeps sit where the drafter never reads, and the next window
     /// overwrites them). absorb[i]: window i's stream drafts.
     pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool) !void {
+        m.joinAhead();
+        m.reuse_ahead = true;
+        m.fill_seq = &.{};
         const e = &m.eng;
         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
         const t0 = m.now();
@@ -866,6 +882,9 @@ pub const Model = struct {
     /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold
     /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
     pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, samp: []const draft.DraftSampling) !void {
+        m.joinAhead();
+        m.reuse_ahead = true;
+        m.fill_seq = &.{};
         if (m.dr == null) return error.NoDrafter;
         const dr = &m.dr.?;
         const pool = &m.dpool.?;

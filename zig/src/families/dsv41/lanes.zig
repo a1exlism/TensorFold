@@ -271,10 +271,23 @@ pub const Lanes = struct {
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
     spill: spill_mod.Spill = .{}, // kept states' rows on disk when the pool needs their room (TF_DS_SPILL_DIR)
+    interleave: bool = false,
+    filling: ?Fill = null,
+
+    const Fill = struct {
+        stream: *lanes.Stream,
+        start: usize,
+        replay: usize,
+        last_end: usize,
+        fine: ?usize,
+    };
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
         if (std.c.getenv("TF_DS_EXACT_TAIL")) |v| exact_tail = std.mem.eql(u8, std.mem.span(v), "1");
+        if (m.rank == 0) {
+            if (std.c.getenv("TF_DS_PREFILL_INTERLEAVE")) |v| ln.interleave = std.mem.eql(u8, std.mem.span(v), "1");
+        }
         ln.spill = spill_mod.Spill.fromEnv(gpa, 0);
         // the round costs by rows: ROUND_MS[min(rows, len) - 1] (the served table, or TF_DS_ROUND_MS)
         const t = m.round_ms;
@@ -285,6 +298,8 @@ pub const Lanes = struct {
 
     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
     pub fn deinit(self: *Lanes) void {
+        self.m.joinAhead();
+        self.m.fill_seq = &.{};
         for (self.snaps.items) |sn| {
             sn.buf.free();
             self.gpa.destroy(sn);
@@ -297,18 +312,25 @@ pub const Lanes = struct {
         self.wire.deinit(self.gpa);
     }
 
+    const vtable: be.Backend.VTable = .{
+        .prefill = prefillFn,
+        .first = firstFn,
+        .queue = queueFn,
+        .read = readFn,
+        .verify = verifyFn,
+        .keep = keepFn,
+        .draft = draftFn,
+        .probabilities = probabilitiesFn,
+        .release = releaseFn,
+    };
+    const part_vtable: be.Backend.VTable = blk: {
+        var v = vtable;
+        v.prefill_part = prefillPartFn;
+        break :blk v;
+    };
+
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = &.{
-            .prefill = prefillFn,
-            .first = firstFn,
-            .queue = queueFn,
-            .read = readFn,
-            .verify = verifyFn,
-            .keep = keepFn,
-            .draft = draftFn,
-            .probabilities = probabilitiesFn,
-            .release = releaseFn,
-        } };
+        return .{ .ptr = self, .vtable = if (self.interleave) &part_vtable else &vtable };
     }
 
     /// The facts the round loop reads: windows of the pending row and up to the drafter's block, several streams'
@@ -374,14 +396,67 @@ pub const Lanes = struct {
     /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
     /// the chunks the gates checked; the host's chunk plan is not followed), the head's draw of the first token.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+        while (!try prefillPartFn(ptr, s)) {}
+    }
+
+    fn prefillPartFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
         const m = self.m;
-        const gpa = self.gpa;
         const t0 = m.now();
         defer if (self.prof) |*p| {
             p.prefill += m.now() - t0;
-            p.prefills += 1;
         };
+        errdefer {
+            releaseFn(ptr, s);
+        }
+        if (self.filling == null) {
+            if (self.prof) |*p| p.prefills += 1;
+            try self.fillStart(s);
+            return false;
+        }
+        const f = &self.filling.?;
+        if (f.stream != s) return error.PrefillInProgress;
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        const seq = self.seqs[l.slot].items;
+        const len = seq.len;
+        const start = f.start;
+        if (start > 0 and s.isCancelled()) return error.Cancelled;
+        var n: usize = @min(model.chunk_rows, len - start);
+        n = @min(n, (start / model.chunk_rows + 1) * model.chunk_rows - start);
+        if (f.fine) |q| {
+            if (start < q and q < start + n) n = q - start;
+        }
+        if (try self.begin(.fill_chunk)) {
+            try self.wire.int(self.gpa, u64, start);
+            try self.wire.int(self.gpa, u32, @intCast(n));
+            try self.wire.int(self.gpa, u64, f.replay);
+            try self.flush();
+        }
+        m.fill_seq = seq;
+        const head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+        f.start += n;
+        if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and ((f.start == f.last_end and f.fine == null) or f.start == (f.fine orelse 0) or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+        if (f.start < len) return false;
+        defer {
+            m.joinAhead();
+            m.fill_seq = &.{};
+            self.filling = null;
+        }
+        if (!head) return error.NoPromptLogits;
+        const logits = try m.promptLogitsHost();
+        if (logits_sha) {
+            var dg: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
+            std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
+        }
+        const token = try draw(logits, len, s.sampling);
+        self.streams.getPtr(s).?.first = self.take(token);
+        return true;
+    }
+
+    fn fillStart(self: *Lanes, s: *lanes.Stream) !void {
+        const m = self.m;
+        const gpa = self.gpa;
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
@@ -517,38 +592,8 @@ pub const Lanes = struct {
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
         const fine: ?usize = if (exact_tail) fineCut(start, len, last_end) else null;
-        var head = false;
         m.fill_seq = seq.items;
-        defer {
-            m.joinAhead();
-            m.fill_seq = &.{};
-        }
-        while (start < len) {
-            if (start > 0 and s.isCancelled()) return error.Cancelled;
-            var n: usize = @min(model.chunk_rows, len - start);
-            n = @min(n, (start / model.chunk_rows + 1) * model.chunk_rows - start); // after an off-grid resume: to the grid
-            if (fine) |q| {
-                if (start < q and q < start + n) n = q - start;
-            }
-            if (try self.begin(.fill_chunk)) {
-                try self.wire.int(gpa, u64, start);
-                try self.wire.int(gpa, u32, @intCast(n));
-                try self.wire.int(gpa, u64, replay);
-                try self.flush();
-            }
-            head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
-            start += n;
-            if (s.reuse.hook) |k| if (start < len and start <= replay and ((start == last_end and fine == null) or start == (fine orelse 0) or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
-        }
-        if (!head) return error.NoPromptLogits;
-        const logits = try m.promptLogitsHost();
-        if (logits_sha) {
-            var dg: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
-            std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
-        }
-        const token = try draw(logits, len, s.sampling);
-        self.streams.getPtr(s).?.first = self.take(token);
+        self.filling = .{ .stream = s, .start = start, .replay = replay, .last_end = last_end, .fine = fine };
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -839,6 +884,11 @@ pub const Lanes = struct {
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
+        if (self.filling) |f| if (f.stream == s) {
+            self.m.joinAhead();
+            self.m.fill_seq = &.{};
+            self.filling = null;
+        };
         const kv = self.streams.fetchRemove(s) orelse return;
         self.used[kv.value.slot] = false;
     }
@@ -924,6 +974,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const n: usize = try r.int(u32);
                 const replay: usize = @intCast(try r.int(u64));
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
+                m.fill_seq = seqs[slot].items;
                 _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
             },
             .verify => {

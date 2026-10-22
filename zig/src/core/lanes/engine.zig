@@ -77,12 +77,28 @@ pub const Engine = struct {
 
     /// Prefill a stream, draw its first token and ask for its first drafts; it takes part from the next round.
     pub fn addStream(e: *Engine, s: *Stream) !void {
+        try e.beginStream(s);
+        while (!try e.prefillPart(s)) {}
+    }
+
+    /// Record admission before the stream's prompt pass starts.
+    pub fn beginStream(e: *Engine, s: *Stream) !void {
         _ = e.arena.reset(.retain_capacity);
         try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
-        e.backend.prefill(s) catch |err| {
+    }
+
+    /// Advance the prompt pass, then commit the first token and admit the stream once it is ready.
+    pub fn prefillPart(e: *Engine, s: *Stream) !bool {
+        const done = e.backend.prefillPart(s) catch |err| {
             if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
             return err;
         };
+        if (!done) return false;
+        try e.finishStream(s);
+        return true;
+    }
+
+    fn finishStream(e: *Engine, s: *Stream) !void {
         if (s.isCancelled()) { // cancelled in its last chunk: no first token
             e.backend.release(s);
             return error.Cancelled;

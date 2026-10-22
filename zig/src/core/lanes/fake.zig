@@ -23,6 +23,7 @@ const Lane = struct {
     held: std.ArrayList(u32) = .empty, // drafts for the next round
     base: usize = 0, // the history length before the last verify
     rows: std.ArrayList(u32) = .empty, // the last verify's row tokens
+    prefill_at: usize = 0,
 };
 
 pub const Fake = struct {
@@ -35,6 +36,7 @@ pub const Fake = struct {
     pattern: []const u32 = &.{ 11, 12, 13 },
     answer_cycles: bool = false,
     prefill_chunks: usize = 0,
+    interleave: bool = false,
     prefill_count: usize = 0,
     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
     prefill_hook_ctx: ?*anyopaque = null,
@@ -53,8 +55,15 @@ pub const Fake = struct {
         l.rows.deinit(gpa);
     }
 
+    const vtable: be.Backend.VTable = .{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release };
+    const part_vtable: be.Backend.VTable = blk: {
+        var v = vtable;
+        v.prefill_part = prefillPart;
+        break :blk v;
+    };
+
     pub fn backend(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+        return .{ .ptr = x, .vtable = if (x.interleave) &part_vtable else &vtable };
     }
 
     fn self(ptr: *anyopaque) *Fake {
@@ -98,16 +107,15 @@ pub const Fake = struct {
 
     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
         const x = self(ptr);
+        try x.beginPrefill(s);
+        while (!try prefillPart(ptr, s)) {}
+    }
+
+    fn beginPrefill(x: *Fake, s: *Stream) !void {
         if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
         const got = try x.lanes.getOrPut(x.gpa, s);
         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
         got.value_ptr.* = .{};
-        const chunks = if (x.prefill_chunks == 0) 1 else x.prefill_chunks;
-        for (0..chunks) |chunk| {
-            x.prefill_count += 1;
-            if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, chunk);
-            if (s.isCancelled()) return error.Cancelled;
-        }
         const h = &got.value_ptr.history;
         s.cached = 0;
         if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
@@ -115,10 +123,29 @@ pub const Fake = struct {
             try h.appendSlice(x.gpa, kept.items);
             s.cached = s.reuse.at;
         }
-        for (s.prompt()[h.items.len..], h.items.len + 1..) |t, at| {
+    }
+
+    fn prefillPart(ptr: *anyopaque, s: *Stream) anyerror!bool {
+        const x = self(ptr);
+        if (!x.lanes.contains(s)) {
+            try x.beginPrefill(s);
+            return false;
+        }
+        const l = x.lane(s);
+        const chunks = @max(1, x.prefill_chunks);
+        const chunk = l.prefill_at;
+        if (chunk == chunks) return true;
+        x.prefill_count += 1;
+        if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, chunk);
+        if (s.isCancelled()) return error.Cancelled;
+        const h = &l.history;
+        const end = s.cached + (s.prompt_len - s.cached) * (chunk + 1) / chunks;
+        for (s.prompt()[h.items.len..end], h.items.len + 1..) |t, at| {
             try h.append(x.gpa, t);
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
         }
+        l.prefill_at += 1;
+        return l.prefill_at == chunks;
     }
 
     /// A copy of the stream's cache at `at` tokens (the prompt pass stands there), for core/prompt_cache.zig.

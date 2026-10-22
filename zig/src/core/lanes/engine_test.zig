@@ -25,9 +25,13 @@ fn model() !Config {
 
 /// Every case's emitted tokens, the cases admitted together and stepped until done.
 fn run(cases: []const Case) ![][]u32 {
+    return runPrefill(cases, false);
+}
+
+fn runPrefill(cases: []const Case, interleave: bool) ![][]u32 {
     var cfg = try model();
     defer cfg.deinit(gpa);
-    var target: fake.Fake = .{ .gpa = gpa };
+    var target: fake.Fake = .{ .gpa = gpa, .interleave = interleave, .prefill_chunks = 6 };
     defer target.deinit();
     var clock: fake.FixedClock = .{};
     var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
@@ -44,7 +48,14 @@ fn run(cases: []const Case) ![][]u32 {
         s.deinit(gpa);
         p.deinit();
     };
-    for (streams) |*s| try engine.addStream(s);
+    for (streams) |*s| {
+        if (interleave) {
+            try engine.beginStream(s);
+            while (!try engine.prefillPart(s)) {
+                if (engine.activeCount() > 0) try engine.step();
+            }
+        } else try engine.addStream(s);
+    }
     while (engine.activeCount() > 0) try engine.step();
     const out = try gpa.alloc([]u32, cases.len);
     for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
@@ -140,6 +151,65 @@ test "shared rounds commit what each stream commits alone" {
     defer free(two);
     try std.testing.expectEqualSlices(u32, one[0], together[0]);
     try std.testing.expectEqualSlices(u32, two[0], together[1]);
+}
+
+test "interleaved prompt chunks commit the same greedy and sampled tokens" {
+    for ([_]?Sampling{ null, .{ .seed = 9, .temperature = 0.7, .top_k = 0, .top_p = 0.95 } }) |sampling| {
+        const cases = [_]Case{ .{ .prompt = &p1, .sampling = sampling }, .{ .prompt = &p2, .sampling = sampling, .think_budget = 9 }, .{ .prompt = &p1, .sampling = sampling, .drafts = false } };
+        const sync = try runPrefill(&cases, false);
+        defer free(sync);
+        const parts = try runPrefill(&cases, true);
+        defer free(parts);
+        for (sync, parts) |a, b| try std.testing.expectEqualSlices(u32, a, b);
+    }
+}
+
+test "a running stream advances between prompt chunks and survives a prompt cancellation" {
+    var cfg = try model();
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa, .interleave = true, .prefill_chunks = 6 };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer engine.deinit();
+    var running = try sm.Stream.init(gpa, .{ .id = "running", .prompt = &p1, .max_new = 100, .drafts = false });
+    defer running.deinit(gpa);
+    const Cancel = struct {
+        value: bool = false,
+        fn check(ptr: *anyopaque) bool {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            return c.value;
+        }
+    };
+    var cancel: Cancel = .{};
+    var filling = try sm.Stream.init(gpa, .{ .id = "filling", .prompt = &p2, .max_new = 40, .cancel_check = .{ .ptr = &cancel, .check = Cancel.check } });
+    defer filling.deinit(gpa);
+    try engine.addStream(&running);
+    try engine.beginStream(&filling);
+    try std.testing.expect(!try engine.prefillPart(&filling));
+    for (0..3) |_| {
+        const chunks = target.prefill_count;
+        try std.testing.expect(!try engine.prefillPart(&filling));
+        try std.testing.expectEqual(chunks + 1, target.prefill_count);
+        const rounds = running.rounds;
+        try engine.step();
+        try std.testing.expectEqual(rounds + 1, running.rounds);
+        try std.testing.expectEqual(@as(usize, 1), engine.activeCount());
+        try std.testing.expectEqual(@as(usize, 0), filling.emitted().len);
+    }
+    cancel.value = true;
+    try std.testing.expectError(error.Cancelled, engine.prefillPart(&filling));
+    try std.testing.expect(!target.lanes.contains(&filling));
+    try std.testing.expect(target.lanes.contains(&running));
+    while (engine.activeCount() > 0) try engine.step();
+    var history: std.ArrayList(u32) = .empty;
+    defer history.deinit(gpa);
+    try history.appendSlice(gpa, &p1);
+    for (running.emitted()) |token| {
+        try std.testing.expectEqual(fake.next(history.items, null, history.items.len), token);
+        try history.append(gpa, token);
+    }
+    try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
 }
 
 test "the thinking budget's forced close is the same drafted, plain and shared" {

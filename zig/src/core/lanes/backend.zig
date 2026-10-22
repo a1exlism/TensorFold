@@ -49,6 +49,8 @@ pub const Backend = struct {
     pub const VTable = struct {
         /// Prefill the stream's prompt into its caches (and its draft head's).
         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
+        /// Advance at most one prompt chunk; true once the stream is ready for first().
+        prefill_part: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!bool = null,
         /// Draw the first token from the prompt's last row at `position`; a handle to it.
         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.
@@ -75,6 +77,14 @@ pub const Backend = struct {
 
     pub fn prefill(b: Backend, s: *Stream) !void {
         return b.vtable.prefill(b.ptr, s);
+    }
+    pub fn steps(b: Backend) bool {
+        return b.vtable.prefill_part != null;
+    }
+    pub fn prefillPart(b: Backend, s: *Stream) !bool {
+        if (b.vtable.prefill_part) |part| return part(b.ptr, s);
+        try b.prefill(s);
+        return true;
     }
     pub fn first(b: Backend, s: *Stream, position: u64) !u64 {
         return b.vtable.first(b.ptr, s, position);

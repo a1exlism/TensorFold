@@ -9,11 +9,11 @@ const Event = api.Event;
 const Request = api.Request;
 const Reason = api.Reason;
 
-test "a lane host resumes a conversation from its kept prompt state and reports the cached tokens" {
+fn resumePrompt(interleave: bool) !void {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .interleave = interleave, .prefill_chunks = if (interleave) 6 else 0 };
     defer target.deinit();
     var clock: lanes.fake.FixedClock = .{};
     var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
@@ -96,11 +96,19 @@ test "a lane host resumes a conversation from its kept prompt state and reports 
     try std.testing.expectEqual(@as(usize, 2), store.entries.items.len);
 }
 
-test "a turn's mark evicting the state it resumed from: the hit is reported first and the entry freed once" {
+test "a lane host resumes a conversation from its kept prompt state and reports the cached tokens" {
+    try resumePrompt(false);
+}
+
+test "a lane host resumes a stepped prompt from its kept state" {
+    try resumePrompt(true);
+}
+
+fn evictResumed(interleave: bool) !void {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .interleave = interleave, .prefill_chunks = if (interleave) 6 else 0 };
     defer target.deinit();
     var clock: lanes.fake.FixedClock = .{};
     var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
@@ -196,4 +204,12 @@ test "a turn's mark evicting the state it resumed from: the hit is reported firs
         try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
         try history.append(gpa, t);
     }
+}
+
+test "a turn's mark evicting the state it resumed from: the hit is reported first and the entry freed once" {
+    try evictResumed(false);
+}
+
+test "a stepped prompt reports its cache hit before a mark evicts the resumed state" {
+    try evictResumed(true);
 }

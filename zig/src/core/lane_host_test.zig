@@ -94,3 +94,170 @@ test "a request the backend refuses fails alone, in the backend's words" {
     try std.testing.expectEqual(Reason.length, plain.wait());
     try std.testing.expectEqual(@as(usize, 64), plain.tokens);
 }
+
+const PrefillProbe = struct {
+    mutex: std.Io.Mutex = .init,
+    engine: api.Engine,
+    host: *LaneHost,
+    requests: [2]Request,
+    tokens: [3]std.ArrayList(u32) = @splat(.empty),
+    done: [3]?Reason = @splat(null),
+    prefilled: [3]bool = @splat(false),
+    chunks: [3]usize = @splat(0),
+    last_tokens: [3]usize = @splat(0),
+    submitted: bool = false,
+    bad_order: bool = false,
+    cancel: bool = false,
+    cancelled: bool = false,
+    limited: bool = false,
+    closing: bool = false,
+    refusals: usize = 0,
+
+    fn event(ctx: *anyopaque, id: Id, e: *const Event) void {
+        const p: *@This() = @ptrCast(@alignCast(ctx));
+        p.mutex.lockUncancelable(std.testing.io);
+        defer p.mutex.unlock(std.testing.io);
+        const i: usize = @intCast(id - 1);
+        switch (e.*) {
+            .prefilled => p.prefilled[i] = true,
+            .tokens => |tokens| {
+                if (!p.prefilled[i]) p.bad_order = true;
+                p.tokens[i].appendSlice(std.testing.allocator, tokens) catch {
+                    p.bad_order = true;
+                };
+                if (id == 1 and !p.submitted) {
+                    p.submitted = true;
+                    for (&p.requests, 2..) |*r, next_id| p.engine.submit(next_id, r, .{ .ctx = p, .event = event }) catch {
+                        p.bad_order = true;
+                    };
+                }
+                if (id == 1 and p.cancel and !p.cancelled and p.chunks[1] == 1) {
+                    p.cancelled = true;
+                    p.engine.cancel(2);
+                }
+            },
+            .finished => |f| p.done[i] = f.reason,
+        }
+    }
+
+    fn chunk(ctx: *anyopaque, s: *lanes.Stream, _: usize) void {
+        const p: *@This() = @ptrCast(@alignCast(ctx));
+        p.mutex.lockUncancelable(std.testing.io);
+        const i: usize = @intCast(s.prompt()[0] - 1);
+        if (i > 0 and p.chunks[i] > 0 and p.done[0] == null and p.tokens[0].items.len <= p.last_tokens[i]) p.bad_order = true;
+        if (i == 2 and !p.prefilled[1] and p.done[1] == null) p.bad_order = true;
+        p.last_tokens[i] = p.tokens[0].items.len;
+        p.chunks[i] += 1;
+        p.mutex.unlock(std.testing.io);
+        if (p.closing and i == 1) {
+            while (true) {
+                p.host.mutex.lockUncancelable(std.testing.io);
+                const closing = p.host.closing;
+                p.host.mutex.unlock(std.testing.io);
+                if (closing) break;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    }
+
+    fn part(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+        const x: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
+        const p: *@This() = @ptrCast(@alignCast(x.prefill_hook_ctx.?));
+        if (p.limited and x.lanes.count() > 0 and !x.lanes.contains(s)) {
+            p.refusals += 1;
+            return error.ContextFull;
+        }
+        return x.backend().prefillPart(s);
+    }
+
+    fn wait(p: *@This()) void {
+        while (true) {
+            p.mutex.lockUncancelable(std.testing.io);
+            const done = if (p.closing) p.chunks[1] > 0 else p.done[0] != null and p.done[1] != null and p.done[2] != null;
+            p.mutex.unlock(std.testing.io);
+            if (done) return;
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+        }
+    }
+};
+
+const PrefillMode = enum { interleave, cancel, limited, closing };
+
+fn runPrefill(mode: PrefillMode) !void {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .interleave = true, .prefill_chunks = 6 };
+    defer target.deinit();
+    var vtable = target.backend().vtable.*;
+    vtable.prefill_part = PrefillProbe.part;
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, .{ .ptr = &target, .vtable = &vtable }, clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 3 });
+    const first: Request = .{ .prompt = &.{ 1, 4, 1 }, .max_tokens = 32, .drafts = false };
+    var probe: PrefillProbe = .{
+        .engine = host.engine(),
+        .host = &host,
+        .requests = .{
+            .{ .prompt = &.{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9 }, .max_tokens = 8, .drafts = false, .sampling = .{ .seed = 7, .temperature = 0.7 } },
+            .{ .prompt = &.{ 3, 1, 4, 1 }, .max_tokens = 8, .drafts = false },
+        },
+        .cancel = mode == .cancel,
+        .limited = mode == .limited,
+        .closing = mode == .closing,
+    };
+    defer for (&probe.tokens) |*tokens| tokens.deinit(gpa);
+    target.prefill_hook = PrefillProbe.chunk;
+    target.prefill_hook_ctx = &probe;
+    {
+        try host.start();
+        defer host.stop();
+        try probe.engine.submit(1, &first, .{ .ctx = &probe, .event = PrefillProbe.event });
+        probe.wait();
+    }
+    try std.testing.expect(!probe.bad_order);
+    try std.testing.expectEqual(@as(usize, if (probe.cancel or probe.closing) 1 else 6), probe.chunks[1]);
+    try std.testing.expectEqual(@as(usize, if (probe.closing) 0 else 6), probe.chunks[2]);
+    try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
+    try std.testing.expect(host.filling == null);
+    if (probe.closing) {
+        for (probe.done) |done| try std.testing.expectEqual(Reason.cancelled, done.?);
+        try std.testing.expectEqual(@as(usize, 0), core.activeCount());
+        return;
+    }
+    if (probe.limited) try std.testing.expect(probe.refusals > 0);
+    const requests = [_]Request{ first, probe.requests[0], probe.requests[1] };
+    for (requests, probe.tokens, probe.done, 0..) |r, tokens, done, i| {
+        if (probe.cancel and i == 1) {
+            try std.testing.expectEqual(Reason.cancelled, done.?);
+            try std.testing.expectEqual(@as(usize, 0), tokens.items.len);
+            continue;
+        }
+        try std.testing.expectEqual(Reason.length, done.?);
+        try std.testing.expectEqual(@as(usize, r.max_tokens), tokens.items.len);
+        var history: std.ArrayList(u32) = .empty;
+        defer history.deinit(gpa);
+        try history.appendSlice(gpa, r.prompt);
+        for (tokens.items) |token| {
+            try std.testing.expectEqual(lanes.fake.next(history.items, r.sampling, history.items.len), token);
+            try history.append(gpa, token);
+        }
+    }
+}
+
+test "a lane host runs a round between prompt chunks and fills queued jobs one at a time" {
+    try runPrefill(.interleave);
+}
+
+test "a lane host releases a cancelled partial prompt and continues its running and queued streams" {
+    try runPrefill(.cancel);
+}
+
+test "a lane host requeues a stepped prompt until the backend has context room" {
+    try runPrefill(.limited);
+}
+
+test "a closing lane host releases its running, filling and queued jobs" {
+    try runPrefill(.closing);
+}
