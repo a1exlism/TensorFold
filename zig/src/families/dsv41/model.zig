@@ -98,6 +98,7 @@ pub const Model = struct {
     blas: cublas.Blas,
     rings: []u64, // each layer's window rings, max_streams slots
     ring_view: []u64, // a filling stream's slot of them
+    snap_encoder: bool = false, // kept states' rings from the encoder layers alone (with replay_floor)
     rd: round.Round,
     graphs: ?round.Graphs = null,
     pgraphs: ?draft.PassGraphs = null, // the drafter pass as CUDA graphs (with graphs)
@@ -156,6 +157,10 @@ pub const Model = struct {
         m.* = undefined;
         m.gpa = gpa;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+        const snap_encoder = if (std.c.getenv("TF_DS_SNAP_ENCODER")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        m.snap_encoder = snap_encoder and prompt.replay_floor;
+        if (snap_encoder and !prompt.replay_floor) std.log.info("TF_DS_SNAP_ENCODER=1 ignored: TF_DS_REPLAY_FLOOR is not enabled", .{});
+        if (m.snap_encoder) std.log.info("kept prompt states: encoder rings and raw stores", .{});
         m.spans = .empty;
         m.img_buf = null;
         m.host = std.heap.ArenaAllocator.init(gpa);
@@ -213,6 +218,7 @@ pub const Model = struct {
         // the ranks' link and NCCL (rank 0 listens: rank 1 retries its connect while rank 0 loads)
         m.fan = try prompt2d.Fan.open(io, o.master, o.port, o.rank, o.world);
         errdefer m.fan.close();
+        try m.snapAgree();
         m.comm = try m.fan.comm(o.rank, o.world);
         errdefer m.comm.deinit();
         // TP2: the decode gathers' RDMA ring (both ranks connect before either returns)
@@ -466,10 +472,11 @@ pub const Model = struct {
     }
 
     /// A kept prompt state's own bytes (the prompt cache's snapshots; the compressed plane stays in the stream's
-    /// extent): one slot's window ring of every layer and positional stores of every ratio-2 layer.
+    /// extent): one slot's window rings (encoder layers alone with snap_encoder) and all positional stores.
     pub fn snapBytes(m: *const Model) usize {
         const pb = prompt.raw_rows * m.eng.c.head_dim * 4;
-        var n: usize = m.rings.len * m.eng.ringBytes();
+        const layers = if (m.snap_encoder) m.eng.c.layers / 2 else m.rings.len;
+        var n: usize = layers * m.eng.ringBytes();
         for (m.caches.raw_kv[0..m.eng.c.layers], m.caches.raw_score[0..m.eng.c.layers]) |k, sc| {
             if (k != 0) n += pb;
             if (sc != 0) n += pb;
@@ -483,7 +490,8 @@ pub const Model = struct {
         const rb = m.eng.ringBytes();
         const pb = prompt.raw_rows * m.eng.c.head_dim * 4;
         var at = buf;
-        for (m.rings) |r| {
+        const layers = if (m.snap_encoder) m.eng.c.layers / 2 else m.rings.len;
+        for (m.rings[0..layers]) |r| {
             try m.copyState(r + slot * rb, at, rb, save);
             at += rb;
         }
@@ -492,6 +500,26 @@ pub const Model = struct {
                 try m.copyState(live + slot * pb, at, pb, save);
                 at += pb;
             };
+        }
+    }
+
+    /// Every rank uses the same kept-state ring layout; a mismatch refuses startup on every rank.
+    fn snapAgree(m: *const Model) !void {
+        const mode = [_]u8{@intFromBool(m.snap_encoder)};
+        var buf: [1]u8 = undefined;
+        if (m.rank == 0) {
+            var same = true;
+            for (m.followers()) |l| {
+                const got = try l.?.recv(&buf);
+                same = std.mem.eql(u8, got, &mode) and same;
+            }
+            const answer = [_]u8{@intFromBool(same)};
+            for (m.followers()) |l| try l.?.send(&answer);
+            if (!same) return error.SnapshotLayoutMismatch;
+        } else {
+            try m.peer().send(&mode);
+            const got = try m.peer().recv(&buf);
+            if (!std.mem.eql(u8, got, &.{1})) return error.SnapshotLayoutMismatch;
         }
     }
 
@@ -918,5 +946,111 @@ fn preadAll(fd: std.c.fd_t, buf: []u8, off: u64) !void {
         }
         if (n == 0) return error.SpillShort;
         done += @intCast(n);
+    }
+}
+
+test "kept states round-trip the selected rings and all raw stores in one slot" {
+    const a = std.testing.allocator;
+    var why: @import("config.zig").Why = .{};
+    const c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    const Copy = struct {
+        fn run(dst: u64, src: u64, bytes: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            const d: [*]u8 = @ptrFromInt(dst);
+            const s: [*]const u8 = @ptrFromInt(src);
+            @memcpy(d[0..bytes], s[0..bytes]);
+            return cuda.abi.success;
+        }
+    };
+    var driver: cuda.Driver = undefined;
+    driver.api.cuMemcpyDtoDAsync_v2 = Copy.run;
+    const ctx: cuda.Context = .{ .d = &driver, .device = 0, .handle = null };
+    var m: Model = undefined;
+    m.ctx = &ctx;
+    m.stream = .{ .d = &driver, .handle = null };
+    m.eng.c = &c;
+    m.caches = .{ .cap = chunk_rows, .slots = 2 };
+    var rings: [40]u64 = undefined;
+    m.rings = &rings;
+    const rb = m.eng.ringBytes();
+    const pb = prompt.raw_rows * c.head_dim * 4;
+    const live = try a.alloc(u8, 2 * (rings.len * rb + 6 * pb));
+    defer a.free(live);
+    for (&rings, 0..) |*r, i| r.* = @intFromPtr(live.ptr + 2 * i * rb);
+    for ([_]usize{ 2, 8, 14 }, 0..) |li, j| {
+        m.caches.raw_kv[li] = @intFromPtr(live.ptr + 2 * rings.len * rb + 4 * j * pb);
+        m.caches.raw_score[li] = m.caches.raw_kv[li] + 2 * pb;
+    }
+    for ([_]bool{ false, true }) |encoder| {
+        m.snap_encoder = encoder;
+        const layers: usize = if (encoder) 20 else 40;
+        const bytes = m.snapBytes();
+        try std.testing.expectEqual(@as(usize, if (encoder) 3735552 else 6684672), bytes);
+        try std.testing.expectEqual(@as(usize, if (encoder) 143 else 80), (@as(usize, 1) << 29) / bytes);
+        const kept = try a.alloc(u8, bytes + 2);
+        defer a.free(kept);
+        @memset(kept, 0xcc);
+        for (live, 0..) |*b, i| b.* = @intCast((i / 4096) % 251);
+        const original = try a.dupe(u8, live);
+        defer a.free(original);
+        try m.snapCopy(1, @intFromPtr(kept.ptr + 1), true);
+        var at: usize = 1;
+        for (0..layers) |i| {
+            try std.testing.expectEqualSlices(u8, original[(2 * i + 1) * rb ..][0..rb], kept[at..][0..rb]);
+            at += rb;
+        }
+        for (0..6) |i| {
+            try std.testing.expectEqualSlices(u8, original[2 * rings.len * rb + (2 * i + 1) * pb ..][0..pb], kept[at..][0..pb]);
+            at += pb;
+        }
+        try std.testing.expectEqual(bytes + 1, at);
+        for (0..rings.len) |i| @memset(live[(2 * i + 1) * rb ..][0..rb], 0xee);
+        for (0..6) |i| @memset(live[2 * rings.len * rb + (2 * i + 1) * pb ..][0..pb], 0xee);
+        try m.snapCopy(1, @intFromPtr(kept.ptr + 1), false);
+        if (encoder) for (20..40) |i| @memset(original[(2 * i + 1) * rb ..][0..rb], 0xee);
+        try std.testing.expectEqualSlices(u8, original, live);
+        try std.testing.expectEqual(@as(u8, 0xcc), kept[0]);
+        try std.testing.expectEqual(@as(u8, 0xcc), kept[bytes + 1]);
+    }
+}
+
+test "ranks agree on the kept-state layout or both refuse startup" {
+    const Peer = struct {
+        m: *const Model,
+        err: ?anyerror = null,
+
+        fn run(p: *@This()) void {
+            p.m.snapAgree() catch |err| {
+                p.err = err;
+            };
+        }
+    };
+    for ([_]bool{ false, true }) |leader| {
+        for ([_]bool{ false, true }) |follower| {
+            var pair: [2]std.c.fd_t = undefined;
+            if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+            defer for (pair) |fd| {
+                _ = std.c.close(fd);
+            };
+            var m0: Model = undefined;
+            m0.rank = 0;
+            m0.world = 2;
+            m0.snap_encoder = leader;
+            m0.fan = .{ .links = .{ .{ .fd = pair[0] }, null, null } };
+            var m1: Model = undefined;
+            m1.rank = 1;
+            m1.snap_encoder = follower;
+            m1.fan = .{ .links = .{ .{ .fd = pair[1] }, null, null } };
+            var peer: Peer = .{ .m = &m1 };
+            const thread = try std.Thread.spawn(.{}, Peer.run, .{&peer});
+            const result = m0.snapAgree();
+            thread.join();
+            if (leader == follower) {
+                try result;
+                try std.testing.expectEqual(@as(?anyerror, null), peer.err);
+            } else {
+                try std.testing.expectError(error.SnapshotLayoutMismatch, result);
+                try std.testing.expectEqual(@as(?anyerror, error.SnapshotLayoutMismatch), peer.err);
+            }
+        }
     }
 }
