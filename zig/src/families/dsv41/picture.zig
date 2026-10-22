@@ -16,6 +16,11 @@ pub const Config = struct {
     min_pixels: usize = 544 * 544,
 };
 
+/// Six little-endian u32 grid dimensions, padded to align the following bf16 patches to 16 bytes.
+pub const header_bytes = 32;
+
+pub const Prepared = struct { tokens: u32, payload: []align(16) const u8 };
+
 /// Packed RGB rows, w * h * 3 bytes.
 pub const Rgb = struct {
     w: usize,
@@ -588,6 +593,18 @@ pub fn fromRgb(a: Allocator, rgb: Rgb, cfg: Config) !Picture {
     var padded = try pad(a, rgb, g.best_w, g.best_h);
     defer padded.deinit(a);
     return .{ .grid = g, .patches = try patchify(a, padded, cfg.patch) };
+}
+
+/// The planned RGB image as its span length and grid header followed by bf16 patches.
+pub fn prepare(a: Allocator, rgb: Rgb, cfg: Config) !Prepared {
+    var pic = try fromRgb(a, rgb, cfg);
+    defer pic.deinit(a);
+    const g = pic.grid;
+    const payload = try a.alignedAlloc(u8, .@"16", header_bytes + pic.patches.len * 2);
+    @memset(payload[0..header_bytes], 0);
+    for ([_]usize{ g.best_h, g.best_w, g.n_vit_h, g.n_vit_w, g.n_llm_h, g.n_llm_w }, 0..) |x, i| std.mem.writeInt(u32, payload[i * 4 ..][0..4], @intCast(x), .little);
+    @memcpy(payload[header_bytes..], std.mem.sliceAsBytes(pic.patches));
+    return .{ .tokens = @intCast(g.spanTokens()), .payload = payload };
 }
 
 test "grids of the vision gate's images as the reference plans them" {

@@ -6,6 +6,7 @@ pub const rank_cache = @import("rank_cache.zig");
 pub const plan = @import("plan.zig");
 pub const engram = @import("engram.zig");
 pub const picture = @import("picture.zig");
+pub const image_cache = @import("image_cache.zig");
 pub const cublaslt = @import("cublaslt.zig");
 pub const fmha = @import("fmha.zig");
 pub const vit = @import("vit.zig");
@@ -58,6 +59,7 @@ test {
     refAll(rank_cache);
     refAll(plan);
     refAll(engram);
+    refAll(image_cache);
     refAll(checkpoint);
     refAll(weights);
     refAll(engram_io);
