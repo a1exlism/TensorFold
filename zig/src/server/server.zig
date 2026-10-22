@@ -143,11 +143,13 @@ pub const Server = struct {
         try merge(options, cx, try fields.parseNumbers(cx, f));
         const temp = number(options.get("temperature")) orelse 0;
         if (temp <= 0) return null;
+        const top_k = @min(@max(0, (if (options.get("top_k")) |k| k.int64() else null) orelse 0), std.math.maxInt(u32));
+        if (srv.info.max_top_k) |max| if (top_k == 0 or top_k > max) return cx.fail(.request, "top_k must be between 1 and {d} when temperature > 0", .{max});
         const seed: u64 = if (options.get("seed")) |s| seedBits(s) else api.seedFor(prompt_ids, srv.config.seed_salt);
         return .{
             .seed = seed,
             .temperature = @floatCast(temp),
-            .top_k = @intCast(@min(@max(0, (if (options.get("top_k")) |k| k.int64() else null) orelse 0), std.math.maxInt(u32))),
+            .top_k = @intCast(top_k),
             .top_p = @floatCast(number(options.get("top_p")) orelse 1.0),
             .min_p = @floatCast(number(options.get("min_p")) orelse 0.0),
         };

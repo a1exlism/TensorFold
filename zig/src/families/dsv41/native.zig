@@ -44,6 +44,7 @@ pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = 4096;
 /// The served lane's reasoning effort numbers (text.zig): the server passes each name and the template hears its number.
 pub const efforts = @import("text.zig").efforts;
+pub const max_top_k: u32 = @import("sampling.zig").max_candidates - @import("sampling.zig").margin;
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
 
@@ -167,6 +168,7 @@ fn deinitFn(ptr: *anyopaque) void {
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.NotPortedYet => "the native DeepSeek-V4.1 engine runs tensor parallel over two GPUs or the four nodes of the 2D split: set TF_TP_WORLD=2 or 4",
+        error.BadSamplingTopK => std.fmt.comptimePrint("top_k must be between 1 and {d} when temperature > 0", .{max_top_k}),
         error.BadImageCache => "TF_DS_IMAGE_CACHE_MIB: a nonnegative whole number of MiB whose byte count fits in a host size",
         error.NoMaster, error.BadMaster => "set TF_TP_MASTER to rank 0's fabric address (rank 1: tf-dsv41-lanes MODEL CACHE 1 2 MASTER PORT KIT; ranks 1-3 of four: ... G 4 ...)",
         error.NoRdmaKernels => "TF_RDMA_DEVICES at world 4 needs TF_DS_RDMA_KERNELS (rdma_gather.cu's fatbin) in a build without the kernel images",
@@ -185,5 +187,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
+    try std.testing.expectEqualStrings("top_k must be between 1 and 56 when temperature > 0", explain(null, error.BadSamplingTopK).?);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }

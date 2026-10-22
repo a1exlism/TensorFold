@@ -146,9 +146,8 @@ pub fn argmax(row: []const f32) usize {
 /// sample_rows for one row of fp32 logits at absolute position `position`: the token.
 pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     if (s.temperature <= 0) return @intCast(argmax(row));
-    if (s.top_k == 0) return error.NotPortedYet; // the nucleus path (top_k off: a model setting only top_p)
-    const count = @min(row.len, s.top_k + margin);
-    if (count > max_candidates) return error.TooManyCandidates;
+    const count = @min(row.len, s.top_k +| margin);
+    if (s.top_k == 0 or count > max_candidates) return error.BadSamplingTopK;
     var values: [max_candidates]f32 = undefined;
     var ids: [max_candidates]i64 = undefined;
     const width = topCandidates(row, count, &values, &ids);
@@ -213,4 +212,23 @@ test "top candidates by value, then id" {
     try std.testing.expectEqual(@as(usize, 4), topCandidates(&row, 4, &v, &ids));
     try std.testing.expectEqualSlices(i64, &.{ 1, 3, 5, 2 }, &ids);
     try std.testing.expectEqualSlices(f32, &.{ 5, 5, 5, 3 }, &v);
+}
+
+test "top_k bounds apply only at positive temperature" {
+    var row: [80]f32 = @splat(-1);
+    row[3] = 2;
+    for ([_]f64{ -1, 0, 1 }) |temp| for ([_]usize{ 0, 20, 56, 57, std.math.maxInt(usize) }) |k| {
+        const s: Sampling = .{ .seed = 0, .temperature = temp, .top_k = k };
+        if (temp <= 0) {
+            try std.testing.expectEqual(@as(i64, 3), try sampleRow(&row, 0, s));
+        } else if (k == 0 or k > max_candidates - margin) {
+            try std.testing.expectError(error.BadSamplingTopK, sampleRow(&row, 0, s));
+        } else {
+            const id = try sampleRow(&row, 0, s);
+            try std.testing.expect(id >= 0 and id < row.len);
+        }
+    };
+    const short = [_]f32{ 0, 1 };
+    const id = try sampleRow(&short, 0, .{ .seed = 1, .temperature = 1, .top_k = 57 });
+    try std.testing.expect(id >= 0 and id < short.len);
 }

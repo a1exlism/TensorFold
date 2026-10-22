@@ -127,6 +127,8 @@ pub const Info = struct {
     /// The engine observes loop_guard requests in its lane stream.
     loop_guard: bool = false,
     structures: bool = false,
+    /// At positive temperature, top_k must be in 1..max_top_k; null leaves it unrestricted here.
+    max_top_k: ?u32 = null,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
