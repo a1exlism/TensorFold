@@ -223,11 +223,12 @@ pub const Chunk = struct {
     cidx: u64 = 0, // int64 [cap, index_topk]: the selected latents
     max_comp: usize = 0,
     // the candidate pool past candidate_blocks blocks (model.py _candidates, apply_candidates): the chunk's block mask
-    // (u8 [cap, pool_ms]), a row block's block maxima (fp32) and their top blocks (int64 [rows, candidate_blocks]), a
+    // (u8 [pool_rows, pool_ms]), a row block's block maxima (fp32) and their top blocks (int64 [rows, candidate_blocks]), a
     // row's every_vis (no mask); the layers before the candidate source's pruned selection (tpos, cand: up to
     // pruned_rows rows)
     pool: u64 = 0,
     pool_ms: usize = 0,
+    pool_rows: usize = 0,
     bmax: u64 = 0,
     pidx: u64 = 0,
     every: u64 = 0,
@@ -283,6 +284,7 @@ pub const Chunk = struct {
         ch.spans = &.{};
         ch.img_rows = 0;
         ch.cap = cap;
+        ch.pool_rows = @min(cap, c.window);
         ch.n = 0;
         ch.start = 0;
         ch.pending = false;
@@ -358,9 +360,9 @@ pub const Chunk = struct {
             const cb = c.candidate_block;
             ch.pool_ms = (ch.max_comp + cb - 1) / cb;
             if (ch.pool_ms > c.candidate_blocks) {
-                ch.pool = try a.take(cap * ch.pool_ms);
+                ch.pool = try a.take(ch.pool_rows * ch.pool_ms);
                 ch.bmax = try a.take(@max(16 * ch.pool_ms, key_elems / cb + cap) * 4);
-                ch.pidx = try a.take(cap * c.candidate_blocks * 8);
+                ch.pidx = try a.take(ch.pool_rows * c.candidate_blocks * 8);
             }
             ch.every = try a.take(cap * 8);
             {
@@ -939,6 +941,12 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         return;
     }
     if (n_comp_end > ch.max_comp) return error.ChunkTooLong;
+    const kk = @min(c.index_topk, n_comp_end);
+    const keyed = li != c.candidate_source and !(c.candidate_source < li) and kk & (kk - 1) == 0;
+    const cb = c.candidate_block;
+    const nbk = (n_comp_end + cb - 1) / cb;
+    const pooled = !keyed and nbk > c.candidate_blocks;
+    if (pooled and (n > ch.pool_rows or ch.pool == 0 or ch.pidx == 0 or nbk > ch.pool_ms)) return error.ChunkTooLong;
     try mm(e, ch, wqb, ch.qr, lay.wq_a.n, ch.iq, .bf16, ih * id);
     try tri_norm.ropeHeads(e.t, ch.iq, rope.cos, rope.sin, ch.pos, c.rope_dim, false, n, ih, id);
     // switch "idx": fp4_qd's bytes in one launch
@@ -951,11 +959,9 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         try e.blas.xwT(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih);
     }
     try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
-    const kk = @min(c.index_topk, n_comp_end);
     // rows in blocks so the [rows, n_comp] keys stay bounded at long contexts
     const rb = @max(16, @min(n, (@as(usize, 1) << 26) / (4 * @max(n_comp_end, 1))));
     if (rb * n_comp_end > key_elems) return error.ChunkTooLong;
-    const keyed = li != c.candidate_source and !(c.candidate_source < li) and kk & (kk - 1) == 0;
     const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
     const torch_topk: tri_index.TopK = .{ .top = ch.ktop, .ctx = @ptrCast(@constCast(e)), .run = torchTopk };
     if (keyed and tri_index.prunes(n_comp_end, kk) and (rb > pruned_rows or ch.pbufs.cand == 0)) return error.ChunkTooLong;
@@ -965,10 +971,6 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     // apply_candidates rewrites only scores already -inf: no launch changes a byte. Past it the source's block maxima
     // (the newest block pinned to +inf) pick the pool's cand_blocks blocks (topk_indices: ties to the lower block), the
     // picked blocks with a finite maximum make the chunk's mask, and the later layers' scores outside it become -inf.
-    const cb = c.candidate_block;
-    const nbk = (n_comp_end + cb - 1) / cb;
-    const pooled = !keyed and nbk > c.candidate_blocks;
-    if (pooled and (ch.pool == 0 or nbk > ch.pool_ms)) return error.ChunkTooLong;
     const pk = @min(c.candidate_blocks, nbk);
     var r0: usize = 0;
     while (r0 < n) : (r0 += rb) {
@@ -984,7 +986,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
             try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, vr, out, ch.pbufs, torch_topk, m, n_comp_end);
         } else {
             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.score, null, false, null, false, m, ih, id);
-            const mrows = ch.pool + r0 * ch.pool_ms;
+            const mrows = if (pooled) ch.pool + r0 * ch.pool_ms else 0;
             if (pooled and li == c.candidate_source) {
                 try e.ops.blockMax(e.s, ch.score, n_comp_end, n_comp_end, cb, vr, ch.bmax, nbk, m);
                 try e.ops.topkIndices(e.s, ch.bmax, nbk, m, nbk, pk, ch.every, ch.pidx);
@@ -1362,6 +1364,40 @@ pub fn endLayer(ch: *Chunk) void {
 
 test "hd ** -0.5 as the served build passes it" {
     try std.testing.expectEqual(@as(u32, 0x3d3504f3), @as(u32, @bitCast(scale(512))));
+}
+
+test "candidate pool overflow is refused before any kernel runs" {
+    var c: Config = undefined;
+    c.index_heads = 32;
+    c.index_head_dim = 128;
+    c.index_topk = 512;
+    c.candidate_source = 0;
+    c.candidate_block = 8;
+    c.candidate_blocks = 2048;
+    var layers: [1]weights.Layer = undefined;
+    var w: weights.Weights = undefined;
+    w.layers = &layers;
+    var e: Engine = undefined;
+    e.c = &c;
+    e.w = &w;
+    var ch: Chunk = undefined;
+    ch.n = 129;
+    ch.max_comp = 1 << 20;
+    ch.pool_rows = 128;
+    ch.pool_ms = (1 << 20) / 8;
+    ch.pool = 1;
+    ch.pidx = 1;
+    var sh: Shared = .{};
+    try std.testing.expectError(error.ChunkTooLong, indexer(&e, &ch, undefined, &sh, 0, undefined, 0, 1 << 20, undefined));
+    ch.n = 128;
+    ch.pool_ms -= 1;
+    try std.testing.expectError(error.ChunkTooLong, indexer(&e, &ch, undefined, &sh, 0, undefined, 0, 1 << 20, undefined));
+    ch.pool_ms += 1;
+    ch.pool = 0;
+    try std.testing.expectError(error.ChunkTooLong, indexer(&e, &ch, undefined, &sh, 0, undefined, 0, 1 << 20, undefined));
+    ch.pool = 1;
+    ch.pidx = 0;
+    try std.testing.expectError(error.ChunkTooLong, indexer(&e, &ch, undefined, &sh, 0, undefined, 0, 1 << 20, undefined));
 }
 
 /// error.NotPortedYet with its site on stderr (a request that reaches a path the port lacks names it in the log).

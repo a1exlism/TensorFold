@@ -1099,6 +1099,36 @@ test "extents take the first chunk-aligned gap" {
     try std.testing.expectEqual(@as(?usize, null), place(&used, 4096, 10240));
 }
 
+test "grid and exact-tail resumes keep decoder chunks within the replay window" {
+    const window: usize = 128;
+    const cr = model.chunk_rows;
+    for ([_]usize{ 1, 127, 128, 129, cr - 1, cr, cr + 1, cr + 104, 2 * cr + 127, 2 * cr + 128, 2 * cr + 129, 2 * cr + 1024 }) |len| {
+        const replay = len -| window;
+        const last_end = @min(replay, len - 1) / cr * cr;
+        for ([_]usize{ 0, last_end, if (last_end >= cr) last_end - 130 else 0 }) |begin| {
+            for ([_]bool{ false, true }) |fine| {
+                const cut = if (fine) fineCut(begin, len, last_end) else null;
+                var start = begin;
+                var rows: usize = 0;
+                var chunks: usize = 0;
+                while (start < len) {
+                    var end = @min(len, (start / cr + 1) * cr);
+                    if (cut) |q| if (start < q and q < end) {
+                        end = q;
+                    };
+                    const n = end -| @max(start, replay);
+                    try std.testing.expect(n <= window);
+                    rows += n;
+                    if (n > 0) chunks += 1;
+                    start = end;
+                }
+                try std.testing.expectEqual(@min(len, window), rows);
+                if (len == cr + 104) try std.testing.expectEqual(@as(usize, 2), chunks);
+            }
+        }
+    }
+}
+
 test "a frame's fields read back as written" {
     const gpa = std.testing.allocator;
     var w: Wire = .{};
