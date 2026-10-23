@@ -78,15 +78,14 @@ pub const Vision = struct {
         defer rgb.deinit(a);
         const prep = picture.prepare(a, rgb, v.cfg) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            problem.* = "image input: the image could not be prepared";
+            problem.* = if (err == error.NoGrid) "image input: image resize did not converge after 10 iterations" else "image input: the image could not be prepared";
             return error.BadImage;
         };
         if (key) |k| v.cache.put(k, prep) catch {};
         return .{ .tokens = prep.tokens, .payload = prep.payload };
     }
 
-    /// The image's RGB as the lane's Pillow decodes it: picture.zig's PNG, else Pillow's own (the refusal in the lane's
-    /// words on BadImage).
+    /// The image's 8-bit RGB: picture.zig's PNG, else pil.zig's (the refusal in the lane's words on BadImage).
     fn decode(v: *Vision, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!picture.Rgb {
         if (picture.decodePng(a, bytes)) |rgb| return rgb else |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,

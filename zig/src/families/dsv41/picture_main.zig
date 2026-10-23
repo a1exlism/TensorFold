@@ -1,4 +1,4 @@
-//! tf-dsv41-picture FILE...: the vision tower's input made of each image as the served lane makes it (picture.zig):
+//! tf-dsv41-picture FILE...: the vision tower's input made of each image as picture.zig makes it:
 //! one JSON line a file with the decoded size, the grid, and sha256 of the RGB pixels, of the padded image and of the
 //! bf16 patches (little-endian), for comparing with py/vfix.py's reference fixtures and the lane's `decode` points.
 const std = @import("std");
@@ -48,7 +48,11 @@ pub fn main(init: std.process.Init) !u8 {
             bad = 1;
             continue;
         };
-        const g = picture.plan(rgb.w, rgb.h, .{});
+        const g = picture.plan(rgb.w, rgb.h, .{}) orelse {
+            try w.print("{{\"file\": \"{s}\", \"error\": \"NoGrid\"}}\n", .{path});
+            bad = 1;
+            continue;
+        };
         var padded = try picture.pad(a, rgb, g.best_w, g.best_h);
         const patches = try picture.patchify(a, padded, 14);
         try w.print("{{\"file\": \"{s}\", \"w\": {d}, \"h\": {d}, \"best_w\": {d}, \"best_h\": {d}, \"n_vit_h\": {d}, \"n_vit_w\": {d}, \"n_llm_h\": {d}, \"n_llm_w\": {d}, \"rgb_sha256\": \"{s}\", \"pad_sha256\": \"{s}\", \"patches_sha256\": \"{s}\"}}\n", .{

@@ -1,10 +1,12 @@
-//! A picture for the vision tower, as DeepSeek's MIT reference (image_processor.py) and the served lane make it:
-//! the image decoded to RGB as PIL's convert("RGB") gives it (PNG here: every colour type, bit depth and interlace),
-//! its grid (plan_image_grid: the patch grid of the ViT and the token grid after the 3x3 aligner), ImageOps.pad to the
-//! grid's pixel size (PIL's 8-bit BICUBIC resample of the image fitted inside, 127 grey around it), then each value
-//! (v / 255 - 0.5) / 0.5 rounded to bf16, in patch order [patch][channel][row][column] (the ViT's linear patch embed
-//! reads each patch flattened that way). Every step is integer or IEEE float math in the reference's order, so the
-//! patches are the lane's byte for byte (gate: tf-dsv41-picture against the recorded `decode` points).
+//! A picture for the vision tower, as DeepSeek's MIT reference (image_processor.py) and the served lane make it, with
+//! DeepSeek Recipe's decode and grid: the image decoded to 8-bit RGB as Recipe's OpenCV preprocessing gives it (PNG
+//! here: every colour type, bit depth and interlace; 16-bit samples divided by 257, transparency blended onto #FDFDFD),
+//! its grid (Recipe's calc_resize: plan_image_grid, the patch grid of the ViT and the token grid after the 3x3 aligner,
+//! repeated on its own result until it holds), ImageOps.pad to the grid's pixel size (PIL's 8-bit BICUBIC resample of
+//! the image fitted inside, 127 grey around it), then each value (v / 255 - 0.5) / 0.5 rounded to bf16, in patch order
+//! [patch][channel][row][column] (the ViT's linear patch embed reads each patch flattened that way). Every step is
+//! integer or IEEE float math in the reference's order, so for an opaque 8-bit image whose grid holds at the first
+//! pass the patches are the lane's byte for byte (gate: tf-dsv41-picture against the recorded `decode` points).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -73,7 +75,6 @@ pub fn spanTypes(g: Grid, out: []Type) void {
     out[i] = .end;
 }
 
-extern "c" fn pow(x: f64, y: f64) f64;
 extern "c" fn sqrt(x: f64) f64;
 
 /// Python's round() of a float: half to even.
@@ -115,15 +116,27 @@ fn solveResize(height: f64, width: f64, p: usize, r: usize, max_n: usize) [2]usi
     return .{ @as(usize, @intFromFloat(@floor(height * beta / fp))) * p, @as(usize, @intFromFloat(@floor(width * beta / fp))) * p };
 }
 
+/// calc_resize for an image of width x height pixels: planOnce repeated on its own pixel size until the grid holds, at
+/// most 10 passes; null when it does not hold by then.
+pub fn plan(width0: usize, height0: usize, cfg: Config) ?Grid {
+    var g = planOnce(width0, height0, cfg);
+    for (1..10) |_| {
+        const next = planOnce(g.best_w, g.best_h, cfg);
+        if (std.meta.eql(next, g)) return g;
+        g = next;
+    }
+    return null;
+}
+
 /// plan_image_grid for an image of width x height pixels (max_wh_ratio unset, as this model's config has it).
-pub fn plan(width0: usize, height0: usize, cfg: Config) Grid {
+fn planOnce(width0: usize, height0: usize, cfg: Config) Grid {
     const p = cfg.patch;
     var width: f64 = @floatFromInt(width0);
     var height: f64 = @floatFromInt(height0);
     const area = width0 * height0;
     if (area > 0 and area < cfg.min_pixels) {
-        // ratio = (min_pixels / (width * height)) ** 0.5; width = int(width * ratio); height = int(height * ratio)
-        const ratio = pow(@as(f64, @floatFromInt(cfg.min_pixels)) / @as(f64, @floatFromInt(area)), 0.5);
+        // ratio = sqrt(min_pixels / (width * height)); width = int(width * ratio); height = int(height * ratio)
+        const ratio = sqrt(@as(f64, @floatFromInt(cfg.min_pixels)) / @as(f64, @floatFromInt(area)));
         width = @trunc(width * ratio);
         height = @trunc(height * ratio);
     }
@@ -160,9 +173,24 @@ pub fn pixels(data: []const u8) ?usize {
     return @as(usize, std.mem.readInt(u32, data[16..20], .big)) * std.mem.readInt(u32, data[20..24], .big);
 }
 
-/// PNG bytes to RGB as PIL's open(...).convert("RGB") gives them: 8-bit samples as they are, 16-bit ones by their high
-/// byte, grey of 1, 2 and 4 bits scaled to 0..255 (0 / 255, x 85, x 17), 16-bit grey clipped at 255 (PIL's I;16 to L),
-/// palette indices through PLTE (missing entries black), alpha dropped. Chunk CRCs are checked, as PIL does.
+/// The background transparency is blended onto: #FDFDFD.
+const background: u32 = 0xfd;
+
+/// A colour sample of opacity `alpha` over the background: (c * alpha + 253 * (255 - alpha) + 127) / 255.
+pub fn blend(c: u8, alpha: u8) u8 {
+    return @intCast((@as(u32, c) * alpha + background * (255 - alpha) + 127) / 255);
+}
+
+/// A 16-bit sample to 8 bits: v / 257 rounded to nearest (never a tie).
+pub fn from16(v: u16) u8 {
+    return @intCast((@as(u32, v) + 128) / 257);
+}
+
+/// PNG bytes to 8-bit RGB as DeepSeek Recipe's OpenCV decode gives them: 16-bit samples divided by 257, grey of 1, 2
+/// and 4 bits scaled to 0..255 (0 / 255, x 85, x 17), palette indices through PLTE (missing entries black), and alpha
+/// blended onto the background: the alpha channel, or tRNS for a palette (entries past it opaque) or an RGB image (the
+/// one colour transparent; at 8 bits its low bytes). tRNS of a grey image, of an image with an alpha channel, of the
+/// wrong length, longer than the PLTE before it, after IDAT or after another tRNS is ignored. Chunk CRCs are checked.
 pub fn decodePng(a: Allocator, data: []const u8) Error!Rgb {
     if (data.len < 8 or !std.mem.eql(u8, data[0..8], signature)) return error.NotPng;
     var at: usize = 8;
@@ -172,6 +200,10 @@ pub fn decodePng(a: Allocator, data: []const u8) Error!Rgb {
     var ctype: u8 = 0;
     var interlace: u8 = 0;
     var palette: [256][3]u8 = @splat(.{ 0, 0, 0 });
+    var entries: usize = 0;
+    var trns: []const u8 = &.{};
+    var trns_entries: usize = 0; // the PLTE entries before tRNS
+    var have_trns = false;
     var have_ihdr = false;
     var idat: std.ArrayList(u8) = .empty;
     defer idat.deinit(a);
@@ -199,6 +231,13 @@ pub fn decodePng(a: Allocator, data: []const u8) Error!Rgb {
         } else if (std.mem.eql(u8, kind, "PLTE")) {
             if (len % 3 != 0 or len > 768) return error.BadPng;
             for (0..len / 3) |i| palette[i] = .{ body[3 * i], body[3 * i + 1], body[3 * i + 2] };
+            entries = len / 3;
+        } else if (std.mem.eql(u8, kind, "tRNS")) {
+            if (!have_trns and idat.items.len == 0) {
+                trns = body;
+                trns_entries = entries;
+                have_trns = true;
+            }
         } else if (std.mem.eql(u8, kind, "IDAT")) {
             try idat.appendSlice(a, body);
         } else if (std.mem.eql(u8, kind, "IEND")) {
@@ -290,24 +329,48 @@ pub fn decodePng(a: Allocator, data: []const u8) Error!Rgb {
         }
     }
 
+    var palette_alpha: [256]u8 = @splat(255);
+    var key: ?[3]u16 = null;
+    switch (ctype) {
+        3 => if (trns.len > 0 and trns.len <= trns_entries) @memcpy(palette_alpha[0..trns.len], trns),
+        2 => if (trns.len == 6) {
+            const mask: u16 = if (depth == 16) 0xffff else 0xff;
+            key = .{ std.mem.readInt(u16, trns[0..2], .big) & mask, std.mem.readInt(u16, trns[2..4], .big) & mask, std.mem.readInt(u16, trns[4..6], .big) & mask };
+        },
+        else => {},
+    }
     const px = try a.alloc(u8, w * h * 3);
     errdefer a.free(px);
     for (0..w * h) |i| {
         const s = samples[i * channels ..][0..channels];
+        var alpha: u8 = 255;
         const rgb: [3]u8 = switch (ctype) {
             0 => blk: {
                 const v = grey(s[0], depth);
                 break :blk .{ v, v, v };
             },
-            2, 6 => .{ hi(s[0], depth), hi(s[1], depth), hi(s[2], depth) },
+            2 => blk: {
+                if (key) |k| if (s[0] == k[0] and s[1] == k[1] and s[2] == k[2]) {
+                    alpha = 0;
+                };
+                break :blk .{ sample8(s[0], depth), sample8(s[1], depth), sample8(s[2], depth) };
+            },
+            6 => blk: {
+                alpha = sample8(s[3], depth);
+                break :blk .{ sample8(s[0], depth), sample8(s[1], depth), sample8(s[2], depth) };
+            },
             4 => blk: {
-                const v = hi(s[0], depth);
+                alpha = sample8(s[1], depth);
+                const v = sample8(s[0], depth);
                 break :blk .{ v, v, v };
             },
-            3 => palette[@min(s[0], 255)],
+            3 => blk: {
+                alpha = palette_alpha[@min(s[0], 255)];
+                break :blk palette[@min(s[0], 255)];
+            },
             else => unreachable,
         };
-        px[i * 3 ..][0..3].* = rgb;
+        px[i * 3 ..][0..3].* = if (alpha == 255) rgb else .{ blend(rgb[0], alpha), blend(rgb[1], alpha), blend(rgb[2], alpha) };
     }
     return .{ .w = w, .h = h, .px = px };
 }
@@ -337,20 +400,18 @@ fn sampleAt(row: []const u8, k: usize, depth: u8) u16 {
     };
 }
 
-/// A colour sample to 8 bits: the high byte of a 16-bit one.
-fn hi(v: u16, depth: u8) u8 {
-    return if (depth == 16) @intCast(v >> 8) else @intCast(v);
+/// An 8- or 16-bit sample to 8 bits.
+fn sample8(v: u16, depth: u8) u8 {
+    return if (depth == 16) from16(v) else @intCast(v);
 }
 
-/// A grey sample to 8 bits as PIL's modes give it: "1" (0 / 255), "L;2" (x 85), "L;4" (x 17), "L", and "I;16" whose
-/// conversion to L clips at 255.
+/// A grey sample of any depth to 8 bits: 1 bit (0 / 255), 2 bits (x 85), 4 bits (x 17), 8 and 16 bits as sample8.
 fn grey(v: u16, depth: u8) u8 {
     return switch (depth) {
         1 => if (v != 0) 255 else 0,
         2 => @intCast(v * 85),
         4 => @intCast(v * 17),
-        8 => @intCast(v),
-        else => @intCast(@min(v, 255)),
+        else => sample8(v, depth),
     };
 }
 
@@ -589,7 +650,7 @@ pub fn picture(a: Allocator, data: []const u8, cfg: Config) !Picture {
 
 /// load_image after its decode: the decoded RGB planned, padded and cut into the ViT's patches.
 pub fn fromRgb(a: Allocator, rgb: Rgb, cfg: Config) !Picture {
-    const g = plan(rgb.w, rgb.h, cfg);
+    const g = plan(rgb.w, rgb.h, cfg) orelse return error.NoGrid;
     var padded = try pad(a, rgb, g.best_w, g.best_h);
     defer padded.deinit(a);
     return .{ .grid = g, .patches = try patchify(a, padded, cfg.patch) };
@@ -620,7 +681,7 @@ test "grids of the vision gate's images as the reference plans them" {
         .{ 3000, 90, 3150, 98, 7, 225, 3, 75 },
     };
     for (cases) |c| {
-        const g = plan(c[0], c[1], cfg);
+        const g = plan(c[0], c[1], cfg).?;
         try std.testing.expectEqual(c[2], g.best_w);
         try std.testing.expectEqual(c[3], g.best_h);
         try std.testing.expectEqual(c[4], g.n_vit_h);
@@ -628,6 +689,50 @@ test "grids of the vision gate's images as the reference plans them" {
         try std.testing.expectEqual(c[6], g.n_llm_h);
         try std.testing.expectEqual(c[7], g.n_llm_w);
     }
+}
+
+test "grids repeat until they hold, as DeepSeek Recipe's calc_resize" {
+    const cfg: Config = .{};
+    // (w, h) -> best_w, best_h, n_llm_h, n_llm_w, tokens (token_spec.rs CASES; 1x161 and 1x352 a single pass plans short)
+    const cases = [_][7]usize{
+        .{ 2, 165, 70, 4942, 118, 2, 356 },
+        .{ 165, 2, 4942, 70, 2, 118, 240 },
+        .{ 158, 10000, 126, 7966, 190, 3, 762 },
+        .{ 10000, 158, 10010, 168, 4, 239, 962 },
+        .{ 1, 1, 546, 546, 13, 13, 184 },
+        .{ 16809, 11841, 1540, 1092, 26, 37, 990 },
+        .{ 1920, 1080, 1708, 966, 23, 41, 968 },
+        .{ 125, 751, 224, 1344, 32, 6, 226 },
+        .{ 1, 161, 42, 7056, 168, 1, 338 },
+        .{ 1, 352, 28, 10570, 252, 1, 506 },
+    };
+    for (cases) |c| {
+        const g = plan(c[0], c[1], cfg).?;
+        try std.testing.expectEqual(c[2], g.best_w);
+        try std.testing.expectEqual(c[3], g.best_h);
+        try std.testing.expectEqual(c[4], g.n_llm_h);
+        try std.testing.expectEqual(c[5], g.n_llm_w);
+        try std.testing.expectEqual(c[6], g.spanTokens());
+    }
+}
+
+test "transparency blends onto #FDFDFD and 16-bit samples divide by 257, as OpenCV decodes them" {
+    try std.testing.expectEqual(@as(u8, 255), from16(65535));
+    try std.testing.expectEqual(@as(u8, 0), from16(128));
+    try std.testing.expectEqual(@as(u8, 1), from16(129));
+    try std.testing.expectEqual(@as(u8, 1), from16(385));
+    try std.testing.expectEqual(@as(u8, 2), from16(386));
+    const a = std.testing.allocator;
+    // 2x1 RGBA at 16 bits: (65535, 0, 32768) at alpha 32768, then all zero
+    const rgba16 = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x02\x00\x00\x00\x01\x10\x06\x00\x00\x00\xa4\xb2\xa3\xc9\x00\x00\x00\x11\x49\x44\x41\x54\x78\xda\x63\xf8\xff\x9f\x81\xa1\x01\x08\x61\x00\x00\x29\xf2\x02\xff\xd4\x40\x35\x50\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+    var x = try decodePng(a, rgba16);
+    defer x.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 254, 126, 190, 253, 253, 253 }, x.px);
+    // 2x1 palette (10, 20, 30), (200, 100, 50), tRNS 0 for the first entry
+    const pal = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x02\x00\x00\x00\x01\x08\x03\x00\x00\x00\xc3\xfc\x8f\xb8\x00\x00\x00\x06\x50\x4c\x54\x45\x0a\x14\x1e\xc8\x64\x32\x77\xa0\xb3\x9c\x00\x00\x00\x01\x74\x52\x4e\x53\x00\x40\xe6\xd8\x66\x00\x00\x00\x0b\x49\x44\x41\x54\x78\xda\x63\x60\x60\x04\x00\x00\x04\x00\x02\x2c\xde\x48\xad\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+    var y = try decodePng(a, pal);
+    defer y.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 253, 253, 253, 200, 100, 50 }, y.px);
 }
 
 test "Python's round: half to even" {
