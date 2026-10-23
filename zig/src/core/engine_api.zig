@@ -116,6 +116,16 @@ pub const Sink = struct {
 pub const Effort = struct { name: []const u8, value: i64 };
 
 /// What the engine serves, fixed once it has loaded.
+/// How the server shapes chat messages before the template renders them.
+pub const MessageForm = struct {
+    /// What joins a message's text parts when none of them is an image.
+    part_separator: []const u8 = "",
+    /// Leading system and developer messages merge into one; false keeps each its own system message.
+    merge_leading_system: bool = true,
+    /// The key that holds a history call's arguments when they are not a JSON object.
+    invalid_arguments_key: []const u8 = "_invalid_arguments",
+};
+
 pub const Info = struct {
     name: []const u8 = "lanes",
     lanes: u32 = 1,
@@ -129,6 +139,7 @@ pub const Info = struct {
     structures: bool = false,
     /// At positive temperature, top_k must be in 1..max_top_k; null leaves it unrestricted here.
     max_top_k: ?u32 = null,
+    message_form: MessageForm = .{},
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.

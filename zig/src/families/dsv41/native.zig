@@ -46,6 +46,7 @@ pub const prompt_rows: u32 = 4096;
 /// The served lane's reasoning effort numbers (text.zig): the server passes each name and the template hears its number.
 pub const efforts = @import("text.zig").efforts;
 pub const max_top_k: u32 = @import("sampling.zig").max_candidates - @import("sampling.zig").margin;
+pub const message_form = @import("text.zig").message_form;
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
 

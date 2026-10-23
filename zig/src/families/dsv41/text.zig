@@ -6,6 +6,14 @@
 //! template's default ("high": 75), the number the lane sends; "none" turns thinking off.
 //! Reasoning split ("</think>" closes the block the generation prompt opens) and DSML tool calls are the server's own.
 
+/// How the server shapes chat messages for this template, as engine_api.MessageForm takes it: text parts joined with
+/// blank lines, each leading system message its own system turn, a history call's bad arguments under "arguments".
+pub const message_form = struct {
+    pub const part_separator = "\n\n";
+    pub const merge_leading_system = false;
+    pub const invalid_arguments_key = "arguments";
+};
+
 /// A name and its number, as engine_api.Effort takes them.
 pub const Effort = struct { name: []const u8, value: i64 };
 

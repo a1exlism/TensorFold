@@ -383,12 +383,18 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .max_top_k = if (@hasDecl(F, "max_top_k")) F.max_top_k else null }, .{ .ctx = loaded.ctx, .text = F.explain });
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .max_top_k = if (@hasDecl(F, "max_top_k")) F.max_top_k else null, .message_form = familyMessageForm(F) }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
 
 /// A family's reasoning efforts as numbers its chat template takes (F.efforts: name and value), else none.
+fn familyMessageForm(comptime F: type) api.MessageForm {
+    if (!@hasDecl(F, "message_form")) return .{};
+    const m = F.message_form;
+    return .{ .part_separator = m.part_separator, .merge_leading_system = m.merge_leading_system, .invalid_arguments_key = m.invalid_arguments_key };
+}
+
 fn familyEfforts(comptime F: type) []const api.Effort {
     if (!@hasDecl(F, "efforts")) return &.{};
     const table = comptime blk: {

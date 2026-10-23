@@ -1,5 +1,6 @@
-//! Chat messages as the template sees them: leading instructions merged, text parts joined, call arguments as objects.
+//! Chat messages as the template sees them: leading instructions placed, text parts joined, call arguments as objects.
 const std = @import("std");
+const api = @import("engine_api");
 const json = @import("json.zig");
 const errors = @import("errors.zig");
 const fields = @import("fields.zig");
@@ -143,15 +144,15 @@ test "base64 as Python's b64decode reads it" {
     try std.testing.expectEqualStrings("", b64decode(a, "").ok);
 }
 
-/// ``normalize_messages`` (text only): leading system and developer text merged, later ones as ``late_system``; a template that needs a user query gains one user turn after a trailing tool run.
-pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool) errors.Refused!Value {
-    return normalizeImages(cx, messages, late_system, needs_user_after_tool, null);
+/// ``normalize_messages`` (text only): leading system and developer text merged unless `form` keeps them apart, later ones as ``late_system``; text parts joined with `form`'s separator; a template that needs a user query gains one user turn after a trailing tool run.
+pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, form: api.MessageForm) errors.Refused!Value {
+    return normalizeImages(cx, messages, late_system, needs_user_after_tool, form, null);
 }
 
 /// normalize, and with `images` (a server that takes them) a request with an image part anywhere as the served lane
 /// renders it (the reference's process_image_messages): every message's content list joined with blank lines, each
 /// image part its placeholder (its bytes into `images`), no message text holding the placeholder.
-pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, images: ?*Images) errors.Refused!Value {
+pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, form: api.MessageForm, images: ?*Images) errors.Refused!Value {
     const list = messages orelse return cx.refuse("messages must be a non-empty list");
     if (list != .array or list.array.len == 0) return cx.refuse("messages must be a non-empty list");
     const with_images = images != null and hasImages(list);
@@ -194,7 +195,7 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
             } else if (content.? != .string) {
                 return cx.refuse("message content must be text or an array of text parts");
             }
-            try place(cx, &out, &instructions, item, role.?.string, late_system);
+            try place(cx, &out, &instructions, item, role.?.string, late_system, form.merge_leading_system);
             continue;
         }
         if (fields.hasMedia(message)) return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
@@ -202,9 +203,10 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
         var item: *json.Object = message.object;
         if (content != null and content.? == .array) {
             var text: std.ArrayList(u8) = .empty;
-            for (content.?.array) |part| {
+            for (content.?.array, 0..) |part, k| {
                 const typed = part == .object and part.get("type") != null and part.get("type").? == .string and std.mem.eql(u8, part.get("type").?.string, "text");
                 if (!typed or fields.hasMedia(part)) return cx.refuse("this server accepts text parts only; image, audio and video inputs are unsupported");
+                if (k > 0) try text.appendSlice(cx.a, form.part_separator);
                 const t = part.get("text") orelse return cx.refuse("a text content part must contain a text string");
                 if (t != .string) return cx.refuse("a text content part must contain a text string");
                 try text.appendSlice(cx.a, t.string);
@@ -215,7 +217,7 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
         } else if (content.? != .string) {
             return cx.refuse("message content must be text or an array of text parts");
         }
-        try place(cx, &out, &instructions, item, role.?.string, late_system);
+        try place(cx, &out, &instructions, item, role.?.string, late_system, form.merge_leading_system);
     }
     if (instructions.items.len > 0) {
         var joined: std.ArrayList(u8) = .empty;
@@ -254,11 +256,11 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
     return .{ .array = out.items };
 }
 
-/// A normalized message into the list: leading instructions held to be merged, a later one as ``late_system``.
-fn place(cx: *Cx, out: *std.ArrayList(Value), instructions: *std.ArrayList(*json.Object), message: *json.Object, r: []const u8, late_system: []const u8) errors.Refused!void {
+/// A normalized message into the list: leading instructions held to be merged (only the first unless `merge`), a later one as ``late_system``.
+fn place(cx: *Cx, out: *std.ArrayList(Value), instructions: *std.ArrayList(*json.Object), message: *json.Object, r: []const u8, late_system: []const u8, merge: bool) errors.Refused!void {
     var item = message;
     if (std.mem.eql(u8, r, "system") or std.mem.eql(u8, r, "developer")) {
-        if (out.items.len == 0) {
+        if (out.items.len == 0 and (merge or instructions.items.len == 0)) {
             try instructions.append(cx.a, item);
             return;
         }
@@ -267,8 +269,8 @@ fn place(cx: *Cx, out: *std.ArrayList(Value), instructions: *std.ArrayList(*json
     try out.append(cx.a, .{ .object = item });
 }
 
-/// ``_normalize_tool_call_arguments``: call arguments as objects for templates; bad ones under ``_invalid_arguments``.
-pub fn toolArguments(cx: *Cx, messages: Value) errors.Refused!Value {
+/// ``_normalize_tool_call_arguments``: call arguments as objects for templates; bad ones under `invalid_key`.
+pub fn toolArguments(cx: *Cx, messages: Value, invalid_key: []const u8) errors.Refused!Value {
     if (messages != .array) return messages;
     const out = try cx.a.alloc(Value, messages.array.len);
     for (messages.array, out) |message, *slot| {
@@ -292,7 +294,7 @@ pub fn toolArguments(cx: *Cx, messages: Value) errors.Refused!Value {
             }
             if (parsed == null or parsed.? != .object) {
                 const wrapped = try json.newObject(cx.a);
-                try wrapped.put(cx.a, "_invalid_arguments", args);
+                try wrapped.put(cx.a, invalid_key, args);
                 parsed = .{ .object = wrapped };
             }
             const fn_copy = try withField(cx, function.object, "arguments", parsed.?);
@@ -335,7 +337,7 @@ test "a conversation with a user query stays byte-identical under the rule" {
     const messages = (try json.parse(cx.a,
         \\[{"role": "user", "content": "run it"}, {"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t1", "content": "42 rows"}, {"role": "assistant", "content": "", "tool_calls": [{"id": "t2", "type": "function", "function": {"name": "g", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t2", "content": "ok"}, {"role": "assistant", "content": "done"}]
     )).ok;
-    const out = try normalize(&cx, messages, "system", true);
+    const out = try normalize(&cx, messages, "system", true, .{});
     // byte-identical: the same messages, in order, nothing gained
     try std.testing.expectEqualStrings(try json.stringify(cx.a, messages, .{ .ascii = false }), try json.stringify(cx.a, out, .{ .ascii = false }));
 }
@@ -347,7 +349,7 @@ test "a conversation with no user query gains one placeholder turn after its las
     const messages = (try json.parse(cx.a,
         \\[{"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t1", "content": "42 rows"}, {"role": "tool", "tool_call_id": "t2", "content": "ok"}]
     )).ok;
-    const out = try normalize(&cx, messages, "system", true);
+    const out = try normalize(&cx, messages, "system", true, .{});
     try std.testing.expectEqual(@as(usize, 4), out.array.len);
     try std.testing.expectEqualStrings("tool", out.array[1].get("role").?.string);
     try std.testing.expectEqualStrings("42 rows", out.array[1].get("content").?.string); // the tool messages unchanged
@@ -372,7 +374,7 @@ test "a user message whose content is wholly a tool block does not count as a qu
     try tool.put(cx.a, "tool_call_id", .{ .string = "t1" });
     try tool.put(cx.a, "content", .{ .string = "done" });
     const messages: Value = .{ .array = try cx.a.dupe(Value, &.{ .{ .object = user }, .{ .object = assistant }, .{ .object = tool } }) };
-    const out = try normalize(&cx, messages, "system", true);
+    const out = try normalize(&cx, messages, "system", true, .{});
     try std.testing.expectEqual(@as(usize, 4), out.array.len);
     try std.testing.expectEqualStrings("user", out.array[3].get("role").?.string);
     try std.testing.expectEqualStrings("(tool results above)", out.array[3].get("content").?.string);
@@ -385,8 +387,43 @@ test "a conversation keeps its shape when the template does not need the rule" {
     const messages = (try json.parse(cx.a,
         \\[{"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": {}}}]}, {"role": "tool", "tool_call_id": "t1", "content": "42 rows"}]
     )).ok;
-    const out = try normalize(&cx, messages, "system", false);
+    const out = try normalize(&cx, messages, "system", false, .{});
     try std.testing.expectEqual(@as(usize, 2), out.array.len);
     try std.testing.expectEqualStrings("assistant", out.array[0].get("role").?.string);
     try std.testing.expectEqualStrings("tool", out.array[1].get("role").?.string);
+}
+
+test "a form with a part separator and unmerged leading systems shapes messages as DeepSeek Recipe does" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const messages = (try json.parse(cx.a,
+        \\[{"role": "system", "content": "a"}, {"role": "developer", "content": [{"type": "text", "text": "b"}, {"type": "text", "text": "c"}]}, {"role": "user", "content": [{"type": "text", "text": "x"}, {"type": "text", "text": "y"}]}]
+    )).ok;
+    const form: api.MessageForm = .{ .part_separator = "\n\n", .merge_leading_system = false, .invalid_arguments_key = "arguments" };
+    const kept = try normalize(&cx, messages, "system", false, form);
+    try std.testing.expectEqual(@as(usize, 3), kept.array.len);
+    for ([_][2][]const u8{ .{ "system", "a" }, .{ "system", "b\n\nc" }, .{ "user", "x\n\ny" } }, kept.array) |want, m| {
+        try std.testing.expectEqualStrings(want[0], m.get("role").?.string);
+        try std.testing.expectEqualStrings(want[1], m.get("content").?.string);
+    }
+    const merged = try normalize(&cx, messages, "system", false, .{});
+    try std.testing.expectEqual(@as(usize, 2), merged.array.len);
+    try std.testing.expectEqualStrings("a\n\nbc", merged.array[0].get("content").?.string);
+    try std.testing.expectEqualStrings("xy", merged.array[1].get("content").?.string);
+}
+
+test "a history call's arguments that are not an object go under the form's key" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const messages = (try json.parse(cx.a,
+        \\[{"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "f", "arguments": "not json"}}]}]
+    )).ok;
+    for ([_][]const u8{ "_invalid_arguments", "arguments" }) |key| {
+        const out = try toolArguments(&cx, messages, key);
+        const args = out.array[0].get("tool_calls").?.array[0].get("function").?.get("arguments").?;
+        try std.testing.expectEqualStrings("not json", args.get(key).?.string);
+        try std.testing.expectEqual(@as(usize, 1), args.object.count());
+    }
 }

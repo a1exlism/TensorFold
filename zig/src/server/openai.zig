@@ -125,10 +125,10 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
     const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
     if (is_chat) {
-        input.messages = try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, take);
+        input.messages = try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, srv.info.message_form, take);
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
-        input.messages = try messages.normalizeImages(cx, m, "system", srv.needs_user_after_tool, take);
+        input.messages = try messages.normalizeImages(cx, m, "system", srv.needs_user_after_tool, srv.info.message_form, take);
     };
     input.images = images.list.items;
     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
