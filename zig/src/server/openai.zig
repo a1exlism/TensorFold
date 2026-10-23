@@ -286,6 +286,8 @@ const Run = struct {
         const thought = try json.newObject(a);
         try thought.put(a, "reasoning_tokens", try json.intValue(a, reply.reasoning_tokens));
         try o.put(a, "completion_tokens_details", .{ .object = thought });
+        try o.put(a, "prompt_cache_hit_tokens", try json.intValue(a, reply.cached_tokens));
+        try o.put(a, "prompt_cache_miss_tokens", try json.intValue(a, reply.prompt_tokens -| reply.cached_tokens));
         return .{ .object = o };
     }
 
