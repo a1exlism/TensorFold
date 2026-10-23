@@ -6,8 +6,8 @@ const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
 
-pub const efforts = [_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh", "max" };
-const effort_order = [_][]const u8{ "max", "xhigh", "high", "medium", "low", "minimal" }; // highest first
+pub const efforts = [_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" };
+const effort_order = [_][]const u8{ "ultra", "max", "xhigh", "high", "medium", "low", "minimal" }; // highest first
 
 /// Python's type name for ``'<type>' object has no attribute 'get'``.
 pub fn typeName(v: Value) []const u8 {
@@ -211,7 +211,7 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
         effort = k.field("reasoning_effort");
     };
     if (effort) |e| {
-        if (e != .string or !isEffort(e.string)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
+        if (e != .string or !isEffort(e.string)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh, max or ultra");
         out.effort = coerceEffort(e.string, levels);
         out.enable = !std.mem.eql(u8, e.string, "none");
     }
@@ -235,7 +235,7 @@ fn order(name: []const u8) ?usize {
 /// The nearest level the template names, ties going higher; xhigh and none stay.
 pub fn coerceEffort(effort: []const u8, levels: []const []const u8) []const u8 {
     if (levels.len == 0) {
-        if (std.mem.eql(u8, effort, "high") or std.mem.eql(u8, effort, "max")) return "xhigh";
+        if (std.mem.eql(u8, effort, "high") or std.mem.eql(u8, effort, "max") or std.mem.eql(u8, effort, "ultra")) return "xhigh";
         if (std.mem.eql(u8, effort, "minimal")) return "low";
         return effort;
     }
@@ -306,6 +306,8 @@ test "efforts and numbers" {
     try std.testing.expectEqualStrings("xhigh", coerceEffort("high", &levels));
     try std.testing.expectEqualStrings("low", coerceEffort("minimal", &levels));
     try std.testing.expectEqualStrings("xhigh", coerceEffort("max", &.{}));
+    try std.testing.expectEqualStrings("xhigh", coerceEffort("ultra", &.{}));
+    try std.testing.expectEqualStrings("xhigh", coerceEffort("ultra", &levels));
     try std.testing.expectEqual(@as(?f64, 1000.5), pyFloat(" 1_000.5 "));
     try std.testing.expect(pyFloat("1__0") == null and pyFloat(".") == null);
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);

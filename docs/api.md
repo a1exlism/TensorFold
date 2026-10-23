@@ -90,7 +90,7 @@ For decisions, `chat_template_kwargs` may be omitted, null, or an object contain
 | `response_format`, `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`, `structured_outputs` | A JSON schema, any JSON object, a regex, a choice or an EBNF grammar the reply must match | Both |
 | `ignore_eos` | Disable model end-of-sequence stopping; the reply limit still applies | Both |
 | `stop` | Stop at a string or any string in a list; omit the matched text from the response | Both |
-| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` | Both |
+| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` or `ultra` | Both |
 | `thinking_budget` | Token-count limit inside reasoning | Both |
 | `priority` | `background` yields to foreground requests | Both |
 
@@ -211,8 +211,9 @@ template. The server also reads it from `chat_template_kwargs.reasoning_effort`,
 top-level field wins. An unnamed level maps to the nearest level the template names, and a tie takes
 the higher one. GLM-5.3 lists `low`, `high` and `max`, so `max` stays `max`, `medium` is heard as `high`
 and `minimal` as `low`. Qwen3.8 lists `low`, `medium` and `xhigh`, so `high` and `max` are heard as `xhigh`.
-`xhigh` stays `xhigh`. GLM-5.3 renders `xhigh` and `max` as Max. A template that names no level hears `max` as
-`xhigh`. `--reasoning-effort` uses the same rule. An omitted effort, with no startup flag, stays
+`xhigh` stays `xhigh`. GLM-5.3 renders `xhigh` and `max` as Max. DeepSeek-V4.1's template hears `minimal` and `low`
+as 50, `medium`, `high` and `xhigh` as 75, and `max` and `ultra` as 100. A template that names no level hears `max`
+and `ultra` as `xhigh`. `--reasoning-effort` uses the same rule. An omitted effort, with no startup flag, stays
 the template's own default. An explicit `chat_template_kwargs.enable_thinking` takes
 precedence. A request without an effort gets `--reasoning-effort` when the server was started with one; otherwise
 the template renders its own default, as vLLM and mlx-lm render it (Qwen3.8's is `xhigh`, which adds an instruction
