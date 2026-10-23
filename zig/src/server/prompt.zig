@@ -63,7 +63,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
 
 /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and
 /// the payload the engine reads), the images in prompt order.
-fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) errors.Refused!Rendered {
+fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const api.Vision.Input) errors.Refused!Rendered {
     const vision = srv.info.vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
     var out: std.ArrayList(u32) = .empty;
     var placed: std.ArrayList(api.Image) = .empty;

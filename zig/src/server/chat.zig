@@ -32,8 +32,9 @@ pub const Input = struct {
     id: []const u8 = "",
     /// ``return_token_ids``: the generated ids in the reply's tensorfold block (the Python server's token_ids).
     token_ids: bool = false,
-    /// The image parts' bytes in prompt order (their placeholders in the messages' text), for an engine with vision.
-    images: []const []const u8 = &.{},
+    /// The image parts' bytes and detail in prompt order (their placeholders in the messages' text), for an engine with
+    /// vision.
+    images: []const api.Vision.Input = &.{},
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).

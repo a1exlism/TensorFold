@@ -70,12 +70,16 @@ pub const Vision = struct {
 
     pub const placeholder = "<\u{ff5c}deepseek_image\u{ff5c}>";
 
-    fn prepareFn(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!lanes.stream.Vision.Prepared {
+    fn prepareFn(ctx: *anyopaque, a: std.mem.Allocator, image: lanes.stream.Vision.Input, problem: *[]const u8) lanes.stream.Vision.PrepareError!lanes.stream.Vision.Prepared {
         const v: *Vision = @ptrCast(@alignCast(ctx));
-        const key: ?image_cache.Key = if (v.cache.max_bytes > 0) image_cache.key(bytes, v.cfg) else null;
+        const key: ?image_cache.Key = if (v.cache.max_bytes > 0) image_cache.key(image.bytes, image.low_detail, v.cfg) else null;
         if (key) |k| if (try v.cache.get(a, k)) |hit| return .{ .tokens = hit.tokens, .payload = hit.payload };
-        var rgb = try v.decode(a, bytes, problem);
+        var rgb = try v.decode(a, image.bytes, problem);
         defer rgb.deinit(a);
+        if (image.low_detail) if (try picture.limitLongSide(a, rgb, picture.low_detail_side)) |small| {
+            rgb.deinit(a);
+            rgb = small;
+        };
         const prep = picture.prepare(a, rgb, v.cfg) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             problem.* = if (err == error.NoGrid) "image input: image resize did not converge after 10 iterations" else "image input: the image could not be prepared";
@@ -154,11 +158,11 @@ test "an image cache hit matches a fresh prepare without decoding again" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var problem: []const u8 = "";
-    const fresh = try Vision.prepareFn(&v, arena.allocator(), png, &problem);
+    const fresh = try Vision.prepareFn(&v, arena.allocator(), .{ .bytes = png }, &problem);
     const buf = try a.alignedAlloc(u8, .@"16", fresh.payload.len);
     defer a.free(buf);
     var fba = std.heap.FixedBufferAllocator.init(buf);
-    const hit = try Vision.prepareFn(&v, fba.allocator(), png, &problem);
+    const hit = try Vision.prepareFn(&v, fba.allocator(), .{ .bytes = png }, &problem);
     try std.testing.expectEqual(fresh.tokens, hit.tokens);
     try std.testing.expectEqualSlices(u8, fresh.payload, hit.payload);
     try std.testing.expectEqual(fresh.payload.len, fba.end_index);

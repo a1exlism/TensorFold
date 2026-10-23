@@ -23,10 +23,10 @@ fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*js
 }
 
 /// A request's images as normalize meets them when the server takes images (its engine's Info.vision): each image
-/// part's bytes in prompt order, the part itself the placeholder in its message's text.
+/// part's bytes and detail in prompt order, the part itself the placeholder in its message's text.
 pub const Images = struct {
     placeholder: []const u8,
-    list: std.ArrayList([]const u8) = .empty,
+    list: std.ArrayList(api.Vision.Input) = .empty,
 };
 
 pub const image_text_refusal = "image input: message text must not contain the image placeholder token";
@@ -49,6 +49,14 @@ fn hasImages(list: Value) bool {
         for (content.array) |part| if (isImagePart(part)) return true;
     }
     return false;
+}
+
+/// Whether an ``image_url`` part's object asks for ``"detail": "low"``.
+fn lowDetail(part: Value) bool {
+    const r = part.get("image_url") orelse return false;
+    if (r != .object) return false;
+    const d = r.get("detail") orelse return false;
+    return d == .string and std.mem.eql(u8, d.string, "low");
 }
 
 /// An ``image_url`` part's bytes: its URL (the part's string, or its object's ``url``) a base64 data URL, the base64 as
@@ -178,7 +186,7 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
                 for (content.?.array, 0..) |part, k| {
                     if (k > 0) try text.appendSlice(cx.a, "\n\n");
                     if (isImagePart(part)) {
-                        try im.list.append(cx.a, try imageBytes(cx, part));
+                        try im.list.append(cx.a, .{ .bytes = try imageBytes(cx, part), .low_detail = lowDetail(part) });
                         try text.appendSlice(cx.a, im.placeholder);
                         continue;
                     }
@@ -425,5 +433,21 @@ test "a history call's arguments that are not an object go under the form's key"
         const args = out.array[0].get("tool_calls").?.array[0].get("function").?.get("arguments").?;
         try std.testing.expectEqualStrings("not json", args.get(key).?.string);
         try std.testing.expectEqual(@as(usize, 1), args.object.count());
+    }
+}
+
+test "an image part's detail low reaches the image list" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const messages = (try json.parse(cx.a,
+        \\[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAEC", "detail": "low"}}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AwQF", "detail": "high"}}, {"type": "image_url", "image_url": "data:image/png;base64,BgcI"}]}]
+    )).ok;
+    var images: Images = .{ .placeholder = "<img>" };
+    _ = try normalizeImages(&cx, messages, "system", false, .{}, &images);
+    try std.testing.expectEqual(@as(usize, 3), images.list.items.len);
+    for ([_]bool{ true, false, false }, [_][]const u8{ "\x00\x01\x02", "\x03\x04\x05", "\x06\x07\x08" }, images.list.items) |low, bytes, got| {
+        try std.testing.expectEqual(low, got.low_detail);
+        try std.testing.expectEqualStrings(bytes, got.bytes);
     }
 }

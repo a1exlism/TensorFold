@@ -4,9 +4,10 @@ const Allocator = std.mem.Allocator;
 
 pub const Key = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
-pub fn key(bytes: []const u8, cfg: picture.Config) Key {
+pub fn key(bytes: []const u8, low_detail: bool, cfg: picture.Config) Key {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(bytes);
+    h.update(&.{@intFromBool(low_detail)});
     inline for (@typeInfo(picture.Config).@"struct".field_names) |name| {
         var buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &buf, @intCast(@field(cfg, name)), .little);
@@ -88,15 +89,16 @@ pub const Cache = struct {
     }
 };
 
-test "image keys include the original bytes and every picture setting" {
+test "image keys include the original bytes, the detail and every picture setting" {
     const cfg: picture.Config = .{};
-    const k = key("image", cfg);
-    try std.testing.expectEqual(k, key("image", cfg));
-    try std.testing.expect(!std.mem.eql(u8, &k, &key("other", cfg)));
+    const k = key("image", false, cfg);
+    try std.testing.expectEqual(k, key("image", false, cfg));
+    try std.testing.expect(!std.mem.eql(u8, &k, &key("other", false, cfg)));
+    try std.testing.expect(!std.mem.eql(u8, &k, &key("image", true, cfg)));
     inline for (@typeInfo(picture.Config).@"struct".field_names) |name| {
         var other = cfg;
         @field(other, name) += 1;
-        try std.testing.expect(!std.mem.eql(u8, &k, &key("image", other)));
+        try std.testing.expect(!std.mem.eql(u8, &k, &key("image", false, other)));
     }
 }
 
@@ -110,7 +112,7 @@ test "image cache hits keep every prepared byte and its alignment" {
     defer a.free(fresh.payload);
     var c = Cache.init(a, std.testing.io, 1 << 20);
     defer c.deinit();
-    const k = key(px, cfg);
+    const k = key(px, false, cfg);
     try std.testing.expectEqual(@as(?picture.Prepared, null), try c.get(a, k));
     try c.put(k, fresh);
     const hit = (try c.get(a, k)).?;
@@ -131,9 +133,9 @@ test "image cache evicts the least recent entry and keeps returned copies alive"
     const size = @sizeOf(Cache.Entry) + bytes.len;
     var c = Cache.init(a, std.testing.io, 2 * size);
     defer c.deinit();
-    const k1 = key("one", .{});
-    const k2 = key("two", .{});
-    const k3 = key("three", .{});
+    const k1 = key("one", false, .{});
+    const k2 = key("two", false, .{});
+    const k3 = key("three", false, .{});
     try c.put(k1, data);
     try c.put(k2, data);
     const kept = (try c.get(a, k1)).?;
@@ -150,7 +152,7 @@ test "image cache budgets disable storage and refuse oversized entries" {
     const a = std.testing.allocator;
     const bytes align(16) = [_]u8{ 1, 2, 3, 4 };
     const data: picture.Prepared = .{ .tokens = 7, .payload = &bytes };
-    const k = key("one", .{});
+    const k = key("one", false, .{});
     for ([_]usize{ 0, @sizeOf(Cache.Entry) + bytes.len - 1 }) |limit| {
         var c = Cache.init(a, std.testing.io, limit);
         defer c.deinit();
@@ -178,7 +180,7 @@ test "image cache requests can insert and copy hits concurrently" {
 
         fn work(w: *@This()) !void {
             const bytes align(16) = [_]u8{ w.id, 2, 3, 4 };
-            const k = key(&bytes, .{});
+            const k = key(&bytes, false, .{});
             for (0..32) |_| {
                 try w.cache.put(k, .{ .tokens = w.id, .payload = &bytes });
                 if (try w.cache.get(std.testing.allocator, k)) |hit| {

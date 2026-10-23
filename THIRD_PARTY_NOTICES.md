@@ -91,7 +91,9 @@ target sampler follows the keyed draws of TensorFold's `tensorfold.engine.exact_
 Its image path (`picture.zig`, `vit.zig`, `vision.zig`, `cublaslt.zig`, `fmha.zig`) follows the same reference's image
 processor, vision tower and aligner (MIT, as above). Pictures decode, and their grid repeats to a fixed point, as
 DeepSeek Recipe 0.2.0's preprocessing computes them (https://github.com/deepseek-ai/deepseek-recipe, MIT License,
-Copyright (c) 2026 DeepSeek; its rules written for TensorFold without including its source), and resample as Pillow's
+Copyright (c) 2026 DeepSeek; its rules written for TensorFold without including its source); at low detail they scale
+down as OpenCV 4.12.0's `resize` with INTER_AREA computes it (https://github.com/opencv/opencv, Apache License 2.0, the
+text of this repository's LICENSE; its arithmetic ported to Zig in `picture.zig`), and resample as Pillow's
 `convert("RGB")` and 8-bit BICUBIC `resize` compute them (Pillow, MIT-CMU License, Copyright © 1997-2011 Secret Labs AB, Copyright © 1995-2011
 Fredrik Lundh and contributors, Copyright © 2010 Jeffrey 'Alex' Clark and contributors; `LICENSES/Pillow-MIT-CMU.txt`),
 written for TensorFold without including Pillow's source; images in formats other than PNG are decoded by the

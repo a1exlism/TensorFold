@@ -106,14 +106,16 @@ pub const Image = struct {
 };
 
 /// A vision family's image input as a server renders it (engine_api.Info.vision): each image part becomes
-/// `placeholder` (one token: `token`) in the template's text, and `prepare` turns the image's bytes into its span's
-/// length and the payload the backend reads (Image.bytes), on the request's thread; on BadImage `problem` says why.
+/// `placeholder` (one token: `token`) in the template's text, and `prepare` turns the image into its span's length and
+/// the payload the backend reads (Image.bytes), on the request's thread; on BadImage `problem` says why.
 pub const Vision = struct {
     ctx: *anyopaque,
     placeholder: []const u8,
     token: u32,
-    prepare: *const fn (ctx: *anyopaque, a: Allocator, bytes: []const u8, problem: *[]const u8) PrepareError!Prepared,
+    prepare: *const fn (ctx: *anyopaque, a: Allocator, image: Input, problem: *[]const u8) PrepareError!Prepared,
 
+    /// An image part: its bytes, and whether it asks for low detail (`"detail": "low"`).
+    pub const Input = struct { bytes: []const u8, low_detail: bool = false };
     pub const Prepared = struct { tokens: u32, payload: []const u8 };
     pub const PrepareError = error{ BadImage, OutOfMemory };
 };

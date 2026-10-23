@@ -415,6 +415,104 @@ fn grey(v: u16, depth: u8) u8 {
     };
 }
 
+// ---------------------------------------------------------------------------------------------- low detail
+
+/// The long side DeepSeek Recipe's low detail limits an image to before its grid.
+pub const low_detail_side: usize = 512;
+
+/// f32 rounded half to even, clamped to 0..255: OpenCV's saturate_cast<uchar>.
+fn saturate8(x: f32) u8 {
+    const f = @floor(x);
+    const d = x - f;
+    var r = f;
+    if (d > 0.5 or (d == 0.5 and @mod(f, 2.0) != 0)) r = f + 1;
+    return @intFromFloat(std.math.clamp(r, 0, 255));
+}
+
+const AreaWeight = struct { di: usize, si: usize, alpha: f32 };
+
+/// OpenCV's computeResizeAreaTab: each destination cell's source pixels and their overlap weights.
+fn areaWeights(a: Allocator, ssize: usize, dsize: usize, cn: usize, scale: f64) ![]AreaWeight {
+    var tab: std.ArrayList(AreaWeight) = .empty;
+    errdefer tab.deinit(a);
+    const s: f64 = @floatFromInt(ssize);
+    for (0..dsize) |dx| {
+        const fsx1 = @as(f64, @floatFromInt(dx)) * scale;
+        const fsx2 = fsx1 + scale;
+        const cell = @min(scale, s - fsx1);
+        var sx1: usize = @intFromFloat(@ceil(fsx1));
+        var sx2: usize = @intFromFloat(@floor(fsx2));
+        sx2 = @min(sx2, ssize - 1);
+        sx1 = @min(sx1, sx2);
+        if (@as(f64, @floatFromInt(sx1)) - fsx1 > 1e-3)
+            try tab.append(a, .{ .di = dx * cn, .si = (sx1 - 1) * cn, .alpha = @floatCast((@as(f64, @floatFromInt(sx1)) - fsx1) / cell) });
+        for (sx1..sx2) |sx| try tab.append(a, .{ .di = dx * cn, .si = sx * cn, .alpha = @floatCast(1.0 / cell) });
+        const rest = fsx2 - @as(f64, @floatFromInt(sx2));
+        if (rest > 1e-3) try tab.append(a, .{ .di = dx * cn, .si = sx2 * cn, .alpha = @floatCast(@min(@min(rest, 1.0), cell) / cell) });
+    }
+    return tab.toOwnedSlice(a);
+}
+
+/// The image scaled down so its long side is at most `max_side`, as DeepSeek Recipe's limit_image_mat does it: each
+/// side times max_side / long side, rounded half away from zero, at least 1, then OpenCV's resize with INTER_AREA in
+/// its generic code (x86, no IPP). Whole-number factors average blocks (2 x 2 as (sum + 2) / 4, others as sum times
+/// 1 / area in f32); other factors weigh each source pixel by its overlap, accumulated in f32 row by row. Null when
+/// the long side is within the limit.
+pub fn limitLongSide(a: Allocator, rgb: Rgb, max_side: usize) error{OutOfMemory}!?Rgb {
+    const long = @max(rgb.w, rgb.h);
+    if (long <= max_side) return null;
+    const ratio = @as(f64, @floatFromInt(max_side)) / @as(f64, @floatFromInt(long));
+    const dw: usize = @max(1, @as(usize, @intFromFloat(@round(@as(f64, @floatFromInt(rgb.w)) * ratio))));
+    const dh: usize = @max(1, @as(usize, @intFromFloat(@round(@as(f64, @floatFromInt(rgb.h)) * ratio))));
+    const scale_x = 1.0 / (@as(f64, @floatFromInt(dw)) / @as(f64, @floatFromInt(rgb.w)));
+    const scale_y = 1.0 / (@as(f64, @floatFromInt(dh)) / @as(f64, @floatFromInt(rgb.h)));
+    const kx = pyRound(scale_x);
+    const ky = pyRound(scale_y);
+    const eps = std.math.floatEps(f64);
+    const px = try a.alloc(u8, dw * dh * 3);
+    errdefer a.free(px);
+    if (@abs(scale_x - @as(f64, @floatFromInt(kx))) < eps and @abs(scale_y - @as(f64, @floatFromInt(ky))) < eps) {
+        const fx: usize = @intCast(kx);
+        const fy: usize = @intCast(ky);
+        std.debug.assert(rgb.w == fx * dw and rgb.h == fy * dh);
+        const scale: f32 = 1.0 / @as(f32, @floatFromInt(fx * fy));
+        for (0..dh) |dy| for (0..dw) |dx| for (0..3) |c| {
+            var sum: u32 = 0;
+            for (0..fy) |sy| for (0..fx) |sx| {
+                sum += rgb.px[((dy * fy + sy) * rgb.w + dx * fx + sx) * 3 + c];
+            };
+            px[(dy * dw + dx) * 3 + c] = if (fx == 2 and fy == 2) @intCast((sum + 2) >> 2) else saturate8(@as(f32, @floatFromInt(sum)) * scale);
+        };
+        return .{ .w = dw, .h = dh, .px = px };
+    }
+    const xtab = try areaWeights(a, rgb.w, dw, 3, scale_x);
+    defer a.free(xtab);
+    const ytab = try areaWeights(a, rgb.h, dh, 1, scale_y);
+    defer a.free(ytab);
+    const buf = try a.alloc(f32, dw * 3);
+    defer a.free(buf);
+    const sum = try a.alloc(f32, dw * 3);
+    defer a.free(sum);
+    @memset(sum, 0);
+    var prev = ytab[0].di;
+    for (ytab) |y| {
+        @memset(buf, 0);
+        const row = rgb.px[y.si * rgb.w * 3 ..][0 .. rgb.w * 3];
+        for (xtab) |x| for (0..3) |c| {
+            buf[x.di + c] = buf[x.di + c] + @as(f32, @floatFromInt(row[x.si + c])) * x.alpha;
+        };
+        if (y.di != prev) {
+            for (sum, px[prev * dw * 3 ..][0 .. dw * 3]) |v, *o| o.* = saturate8(v);
+            for (sum, buf) |*v, b| v.* = y.alpha * b;
+            prev = y.di;
+        } else for (sum, buf) |*v, b| {
+            v.* = v.* + y.alpha * b;
+        }
+    }
+    for (sum, px[prev * dw * 3 ..][0 .. dw * 3]) |v, *o| o.* = saturate8(v);
+    return .{ .w = dw, .h = dh, .px = px };
+}
+
 // ---------------------------------------------------------------------------------------------- PIL resample
 
 const precision_bits = 32 - 8 - 2;
@@ -733,6 +831,24 @@ test "transparency blends onto #FDFDFD and 16-bit samples divide by 257, as Open
     var y = try decodePng(a, pal);
     defer y.deinit(a);
     try std.testing.expectEqualSlices(u8, &.{ 253, 253, 253, 200, 100, 50 }, y.px);
+}
+
+test "low detail scales the long side down as OpenCV's INTER_AREA does on x86" {
+    const a = std.testing.allocator;
+    // pixels (i * 37 + 11) % 256; expected values from opencv-python-headless 4.12.0 on x86_64
+    var src: [9 * 4 * 3]u8 = undefined;
+    for (&src, 0..) |*v, i| v.* = @intCast((i * 37 + 11) % 256);
+    try std.testing.expectEqual(@as(?Rgb, null), try limitLongSide(a, .{ .w = 9, .h = 4, .px = &src }, 9));
+    var block = (try limitLongSide(a, .{ .w = 4, .h = 2, .px = src[0 .. 4 * 2 * 3] }, 2)).?;
+    defer block.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), block.w);
+    try std.testing.expectEqual(@as(usize, 1), block.h);
+    try std.testing.expectEqualSlices(u8, &.{ 97, 134, 107, 127, 100, 137 }, block.px);
+    var weighed = (try limitLongSide(a, .{ .w = 9, .h = 4, .px = &src }, 4)).?;
+    defer weighed.deinit(a);
+    try std.testing.expectEqual(@as(usize, 4), weighed.w);
+    try std.testing.expectEqual(@as(usize, 2), weighed.h);
+    try std.testing.expectEqualSlices(u8, &.{ 129, 95, 118, 148, 143, 109, 111, 148, 156, 130, 110, 147, 136, 173, 82, 98, 136, 130, 118, 98, 135, 137, 117, 97 }, weighed.px);
 }
 
 test "Python's round: half to even" {
