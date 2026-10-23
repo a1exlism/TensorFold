@@ -215,6 +215,12 @@ const Host = struct {
                     return x.inner.vtable.prefill(x.inner.ptr, s);
                 }
             }.f,
+            .prefill_part = if (v.prefill_part != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!bool {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_part.?(x.inner.ptr, s);
+                }
+            }.f else null,
             .first = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
                     const x = bind(p);
@@ -433,6 +439,18 @@ test "context windows: the family default inside the model's, 0 for the model's,
     try std.testing.expectError(error.PastNative, contextWindow(300000, 262144, 16384));
     try std.testing.expectError(error.Negative, contextWindow(-5, 262144, 16384));
     try std.testing.expectError(error.NoNative, contextWindow(0, 0, 16384));
+}
+
+test "the host steps a prompt in chunks exactly when its family does" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |on| {
+        var target: lanes.fake.Fake = .{ .gpa = gpa, .interleave = on };
+        defer target.deinit();
+        var h: Host = undefined;
+        h.gpu = null;
+        h.inner = target.backend();
+        try std.testing.expectEqual(on, h.backend().steps());
+    }
 }
 
 test "a cancel during a long prompt stops it, and the next request's reply is unchanged (#291)" {
